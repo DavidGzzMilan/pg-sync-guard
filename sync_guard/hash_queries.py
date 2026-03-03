@@ -164,8 +164,11 @@ def build_upsert_sql(info: TableInfo) -> str:
     non_pk = [c for c in all_cols if c not in pk_cols]
     set_clauses = ", ".join(f"{c} = EXCLUDED.{c}" for c in non_pk) if non_pk else ", ".join(f"{c} = EXCLUDED.{c}" for c in all_cols)
 
+    # GENERATED ALWAYS identity columns require OVERRIDING SYSTEM VALUE when inserting explicit values
+    overriding = " OVERRIDING SYSTEM VALUE" if info.has_generated_always_identity else ""
+
     return f"""
-INSERT INTO {qual} ({cols_list})
+INSERT INTO {qual} ({cols_list}){overriding}
 VALUES ({placeholders})
 ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clauses}
 """.strip()
