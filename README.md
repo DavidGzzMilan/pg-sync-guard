@@ -8,6 +8,10 @@ Validate data consistency between a PostgreSQL Logical Replication **Publisher**
 - **Bucket hash validation**: Splits the table into \(N\) segments by PK order, computes a deterministic per-segment hash with `md5(row_to_json(...))` and `string_agg(..., '' ORDER BY pk)`, runs the same query on both sides in parallel, and compares results.
 - **Pinpoint & repair**: On mismatch, recursively narrows the segment (same hash query restricted to the segment’s PK range with \(N=2\)) until the range has at most a small batch of rows; then fetches those rows from the Publisher and runs `INSERT ... ON CONFLICT DO UPDATE` on the Subscriber.
 
+## Database user privileges
+
+The role used to connect to Publisher and Subscriber needs specific grants (read-only on Publisher; read + insert/update on Subscriber for repair). See **[docs/REQUIRED_GRANTS.md](docs/REQUIRED_GRANTS.md)** for the SQL definitions.
+
 ## Install
 
 ```bash
