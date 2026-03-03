@@ -12,6 +12,10 @@ Validate data consistency between a PostgreSQL Logical Replication **Publisher**
 
 The role used to connect to Publisher and Subscriber needs specific grants (read-only on Publisher; read + insert/update on Subscriber for repair). See **[docs/REQUIRED_GRANTS.md](docs/REQUIRED_GRANTS.md)** for the SQL definitions.
 
+## Control Plane (optional)
+
+To track runs and remediation in a central schema (e.g. `syncguard.validation_runs` and `syncguard.divergence_log`), use a **separate connection** to a control database and pass `control_conn` to `validate_and_repair`. See **[docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md)** for the schema DDL and usage.
+
 ## Install
 
 ```bash
