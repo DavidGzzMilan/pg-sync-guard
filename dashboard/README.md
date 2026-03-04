@@ -78,10 +78,10 @@ streamlit run dashboard/app.py --server.port 8502
 ## Features
 
 - **Launch Full Validation**: Button runs `python main.py` (or `SYNCGUARD_VALIDATION_CMD` / `validation_command` in secrets) as a background subprocess. PID is stored in session state so only one run at a time. Toasts when the job starts and when it finishes.
-- **Health meter**: Overall Sync % (100 - diverged_tables/total_tables) and Pending Repairs (count where `resolved_at` IS NULL or `is_resolved` is false).
+- **Health meter**: Overall Sync % (100 - diverged_tables/total_tables) and Pending Repairs (count where `resolved_at` IS NULL).
 - **Live execution log**: Expandable "Active Process Logs" shows the last 10 validation runs (optionally filtered by the selected run).
 - **Sidebar**: Filter by monitored table (from `validation_runs.table_name`).
 - **Metrics**: Total checks, active divergences, successful repairs.
 - **Validation runs**: Table of runs; select a diverged run to see mismatches.
-- **Repair console**: For each unresolved divergence: **Manual Review** (repair SQL in a `st.code` block, publisher/subscriber data) and **Execute Repair** (runs that SQL on the Subscriber and sets `resolved_at` / `is_resolved` in the Control DB).
+- **Repair console**: For each unresolved divergence: **Manual Review** (repair SQL in a `st.code` block, publisher/subscriber data) and **Execute Repair** (runs that SQL on the Subscriber and sets `resolved_at` in the Control DB).
 - **Control DB**: All Control DB access uses a context manager so connections are closed and do not hang.

@@ -137,7 +137,7 @@ def fetch_runs(engine, table_filter: str | None = None, run_id_filter: str | Non
 
 
 def fetch_divergences(engine, run_id: str) -> pd.DataFrame:
-    """Divergence log entries for a run. Uses SQLAlchemy engine (named params). resolved_at / is_resolved if columns exist."""
+    """Divergence log entries for a run. Uses SQLAlchemy engine (named params). resolved_at only; is_resolved derived in Python from resolved_at."""
     if engine is None:
         return pd.DataFrame()
     params = {"run_id": run_id}
@@ -215,7 +215,7 @@ def fetch_metrics(conn, table_filter: str | None = None) -> dict:
 
 
 def fetch_health_meter(conn) -> dict:
-    """Overall Sync % and Pending Repairs for Health Meter. Tries resolved_at then is_resolved; rolls back on error so fallbacks run in a clean transaction."""
+    """Overall Sync % and Pending Repairs for Health Meter. Uses resolved_at only (no is_resolved in schema)."""
     if conn is None:
         return {"total_tables": 0, "diverged_tables": 0, "sync_pct": 100.0, "pending_repairs": 0}
     with conn.cursor() as cur:
@@ -239,22 +239,18 @@ def fetch_health_meter(conn) -> dict:
             except Exception:
                 conn.rollback()
                 diverged_tables = 0
+        # Pending repairs: only use resolved_at (Control Plane schema has no is_resolved column)
         try:
             cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log WHERE resolved_at IS NULL")
             pending_repairs = cur.fetchone()[0] or 0
         except Exception:
             conn.rollback()
             try:
-                cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log WHERE (is_resolved IS NULL OR is_resolved = false)")
+                cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log")
                 pending_repairs = cur.fetchone()[0] or 0
             except Exception:
                 conn.rollback()
-                try:
-                    cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log")
-                    pending_repairs = cur.fetchone()[0] or 0
-                except Exception:
-                    conn.rollback()
-                    pending_repairs = 0
+                pending_repairs = 0
 
     if total_tables == 0:
         sync_pct = 100.0
@@ -291,7 +287,7 @@ def execute_repair(subscriber_conn, repair_sql: str, publisher_data: dict) -> No
 
 
 def mark_log_resolved(control_conn, log_id: int) -> None:
-    """Set resolved_at = now() for the given log_id. Raises if conn is None or commit fails."""
+    """Set resolved_at = now() for the given log_id (Control Plane schema has no is_resolved)."""
     if control_conn is None:
         raise ValueError("Control DB connection is None")
     with control_conn.cursor() as cur:
@@ -299,13 +295,6 @@ def mark_log_resolved(control_conn, log_id: int) -> None:
             f"UPDATE {SCHEMA}.divergence_log SET resolved_at = %s WHERE log_id = %s",
             (datetime.now(timezone.utc), log_id),
         )
-        try:
-            cur.execute(
-                f"UPDATE {SCHEMA}.divergence_log SET is_resolved = true WHERE log_id = %s",
-                (log_id,),
-            )
-        except Exception:
-            pass
     control_conn.commit()
 
 
