@@ -16,6 +16,15 @@ The role used to connect to Publisher and Subscriber needs specific grants (read
 
 To track runs and remediation in a central schema (e.g. `syncguard.validation_runs` and `syncguard.divergence_log`), use a **separate connection** to a control database and pass `control_conn` to `validate_and_repair`. See **[docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md)** for the schema DDL and usage.
 
+## Dashboard (optional)
+
+A **Streamlit dashboard** reads from the Control database and shows metrics, validation run history, and divergence details. You can re-run a repair on the Subscriber from the UI and mark log entries as resolved. See **[dashboard/README.md](dashboard/README.md)** for setup; run with:
+
+```bash
+pip install -e ".[dashboard]"
+streamlit run dashboard/app.py
+```
+
 ## Install
 
 ```bash

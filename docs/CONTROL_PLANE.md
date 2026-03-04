@@ -27,8 +27,12 @@ CREATE TABLE syncguard.divergence_log (
     publisher_data JSONB,
     subscriber_data JSONB,
     repair_sql TEXT,
-    repaired_at TIMESTAMP WITH TIME ZONE
+    repaired_at TIMESTAMP WITH TIME ZONE,
+    resolved_at TIMESTAMP WITH TIME ZONE  -- set when user marks as resolved from dashboard (e.g. after re-running repair)
 );
+
+-- If you already have divergence_log without resolved_at:
+-- ALTER TABLE syncguard.divergence_log ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE;
 ```
 
 ## Required grants (control database)
@@ -38,7 +42,7 @@ The role used to connect to the control DB needs:
 ```sql
 GRANT USAGE ON SCHEMA syncguard TO syncguard_user;
 GRANT INSERT, SELECT, UPDATE ON syncguard.validation_runs TO syncguard_user;
-GRANT INSERT, SELECT ON syncguard.divergence_log TO syncguard_user;
+GRANT INSERT, SELECT, UPDATE ON syncguard.divergence_log TO syncguard_user;
 GRANT USAGE, SELECT ON SEQUENCE syncguard.divergence_log_log_id_seq TO syncguard_user;
 ```
 

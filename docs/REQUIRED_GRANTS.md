@@ -63,13 +63,13 @@ When using the [Control Plane](CONTROL_PLANE.md) (syncguard schema), the role th
 - **Connect** to the database.
 - **Usage** on schema `syncguard`.
 - **Insert**, **Select**, **Update** on `syncguard.validation_runs`.
-- **Insert**, **Select** on `syncguard.divergence_log`, plus **Usage, Select** on the sequence `syncguard.divergence_log_log_id_seq`.
+- **Insert**, **Select**, **Update** on `syncguard.divergence_log` (Update needed for dashboard "mark resolved"), plus **Usage, Select** on the sequence `syncguard.divergence_log_log_id_seq`.
 
 ```sql
 GRANT CONNECT ON DATABASE your_control_database TO syncguard_user;
 GRANT USAGE ON SCHEMA syncguard TO syncguard_user;
 GRANT INSERT, SELECT, UPDATE ON syncguard.validation_runs TO syncguard_user;
-GRANT INSERT, SELECT ON syncguard.divergence_log TO syncguard_user;
+GRANT INSERT, SELECT, UPDATE ON syncguard.divergence_log TO syncguard_user;
 GRANT USAGE, SELECT ON SEQUENCE syncguard.divergence_log_log_id_seq TO syncguard_user;
 ```
 
