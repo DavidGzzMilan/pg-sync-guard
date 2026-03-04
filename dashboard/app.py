@@ -291,17 +291,14 @@ def execute_repair(subscriber_conn, repair_sql: str, publisher_data: dict) -> No
 
 
 def mark_log_resolved(control_conn, log_id: int) -> None:
-    """Set resolved_at = now() and is_resolved = true if column exists."""
+    """Set resolved_at = now() for the given log_id. Raises if conn is None or commit fails."""
     if control_conn is None:
-        return
+        raise ValueError("Control DB connection is None")
     with control_conn.cursor() as cur:
-        try:
-            cur.execute(
-                f"UPDATE {SCHEMA}.divergence_log SET resolved_at = %s WHERE log_id = %s",
-                (datetime.now(timezone.utc), log_id),
-            )
-        except Exception:
-            pass
+        cur.execute(
+            f"UPDATE {SCHEMA}.divergence_log SET resolved_at = %s WHERE log_id = %s",
+            (datetime.now(timezone.utc), log_id),
+        )
         try:
             cur.execute(
                 f"UPDATE {SCHEMA}.divergence_log SET is_resolved = true WHERE log_id = %s",
@@ -310,6 +307,19 @@ def mark_log_resolved(control_conn, log_id: int) -> None:
         except Exception:
             pass
     control_conn.commit()
+
+
+def verify_log_resolved(control_conn, log_id: int) -> bool:
+    """Return True if divergence_log row has resolved_at set (confirms write persisted)."""
+    if control_conn is None:
+        return False
+    with control_conn.cursor() as cur:
+        cur.execute(
+            f"SELECT resolved_at FROM {SCHEMA}.divergence_log WHERE log_id = %s",
+            (log_id,),
+        )
+        row = cur.fetchone()
+    return row is not None and row[0] is not None
 
 
 # -----------------------------------------------------------------------------
@@ -415,9 +425,20 @@ def main():
             if proc is not None:
                 st.session_state.validation_pid = proc.pid
                 st.session_state.validation_finished_toast_shown = False
-                st.session_state.last_action_message = f"Validation started in background (PID {proc.pid})."
+                st.session_state.last_action_message = (
+                    f"Process started (PID {proc.pid}). Command: {cmd} — "
+                    "that process must run SyncGuard and write to the Control DB. "
+                    "If no new run appears, check the command exists (e.g. main.py) and connects to your DBs."
+                )
                 st.session_state.last_action_type = "success"
-                st.toast("Background validation started.", icon="🚀")
+                st.toast("Validation process started.", icon="🚀")
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
+            else:
+                st.session_state.last_action_message = f"Failed to start process. Command: {cmd}"
+                st.session_state.last_action_type = "error"
                 try:
                     st.rerun()
                 except Exception:
@@ -539,7 +560,7 @@ def main():
                                     try:
                                         sub_conn = get_subscriber_conn()
                                         if not sub_conn:
-                                            st.session_state.last_action_message = "Subscriber connection not available."
+                                            st.session_state.last_action_message = "Subscriber connection not available. Set SYNCGUARD_SUBSCRIBER_DSN or subscriber_database in secrets."
                                             st.session_state.last_action_type = "error"
                                         else:
                                             pub_data = row["publisher_data"]
@@ -548,9 +569,13 @@ def main():
                                             execute_repair(sub_conn, row["repair_sql"], pub_data)
                                             sub_conn.close()
                                             mark_log_resolved(conn, log_id)
-                                            st.session_state.last_action_message = f"Repair executed for log_id {log_id}."
-                                            st.session_state.last_action_type = "success"
-                                            st.toast(f"Repair executed for log_id {log_id}.", icon="✅")
+                                            if verify_log_resolved(conn, log_id):
+                                                st.session_state.last_action_message = f"Repair executed for log_id {log_id} (subscriber updated, log marked resolved in Control DB)."
+                                                st.session_state.last_action_type = "success"
+                                                st.toast(f"Repair executed for log_id {log_id}.", icon="✅")
+                                            else:
+                                                st.session_state.last_action_message = f"Repair ran but Control DB update did not persist for log_id {log_id}. Check connection and resolved_at column."
+                                                st.session_state.last_action_type = "error"
                                         try:
                                             st.rerun()
                                         except Exception:
