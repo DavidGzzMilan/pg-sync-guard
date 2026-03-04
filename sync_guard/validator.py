@@ -37,6 +37,20 @@ def console_progress(stage: str, detail: str) -> None:
     """Default progress callback that prints to stdout with a [SyncGuard] prefix."""
     print(f"[SyncGuard] {stage}: {detail}")
 
+
+def _rows_equal(pub_row: asyncpg.Record, sub_row: asyncpg.Record, col_names: List[str]) -> bool:
+    """
+    Return True if the two rows have the same values for all columns.
+    Uses the same JSON-serializable normalization as the control plane so that
+    e.g. Decimal vs int or datetime with/without tz compare correctly.
+    """
+    pub_d = ControlPlane.record_to_jsonable(pub_row)
+    sub_d = ControlPlane.record_to_jsonable(sub_row)
+    for c in col_names:
+        if pub_d.get(c) != sub_d.get(c):
+            return False
+    return True
+
 # Default segment count for initial validation
 DEFAULT_NUM_SEGMENTS = 32
 # When narrowing, split into this many sub-segments
@@ -249,10 +263,14 @@ class SyncGuard:
             pk_vals = tuple(row[c] for c in pk_names)
             values = tuple(row[c] for c in col_names)
 
-            # Optionally capture subscriber row before repair (for divergence_log)
-            sub_row = None
-            if control_plane and run_id:
-                sub_row = await self.subscriber.fetchrow(fetch_row_sql, *pk_vals)
+            # Always fetch subscriber row: to skip upsert when already identical (avoids false positives
+            # from segment-boundary shifts when row counts differ) and for divergence_log when we do repair
+            sub_row = await self.subscriber.fetchrow(fetch_row_sql, *pk_vals)
+
+            # Skip if subscriber already has the same row (no actual divergence)
+            if sub_row is not None and _rows_equal(row, sub_row, col_names):
+                logger.debug("Skipping PK %s: subscriber row matches publisher", pk_vals)
+                continue
 
             try:
                 await self.subscriber.execute(upsert_sql, *values)
