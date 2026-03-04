@@ -32,6 +32,7 @@ class ColumnInfo:
     is_primary_key: bool
     ordinal_position: int
     is_high_churn: bool = False
+    is_generated_always: bool = False  # GENERATED ALWAYS AS IDENTITY
 
     def __post_init__(self) -> None:
         self.is_high_churn = self.data_type.lower() in HIGH_CHURN_TYPES
@@ -56,6 +57,11 @@ class TableInfo:
     @property
     def high_churn_columns(self) -> List[str]:
         return [c.name for c in self.columns if c.is_high_churn and not c.is_primary_key]
+
+    @property
+    def has_generated_always_identity(self) -> bool:
+        """True if any column is GENERATED ALWAYS AS IDENTITY (requires OVERRIDING SYSTEM VALUE on insert)."""
+        return any(c.is_generated_always for c in self.columns)
 
     def pk_order_clause(self) -> str:
         """ORDER BY clause for deterministic row ordering (PK columns)."""
@@ -90,11 +96,12 @@ async def analyze_table(conn, schema: str, table: str) -> TableInfo:
     if not primary_key_columns:
         raise SchemaError(f'Table "{schema}"."{table}" has no primary key')
 
-    # All columns with types
+    # All columns with types and identity (attidentity: 'a' = GENERATED ALWAYS, 'd' = BY DEFAULT)
     cols_sql = """
     SELECT a.attname AS name,
            pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-           a.attnum AS ordinal_position
+           a.attnum AS ordinal_position,
+           a.attidentity = 'a' AS is_generated_always
     FROM pg_attribute a
     JOIN pg_class c ON c.oid = a.attrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -110,6 +117,7 @@ async def analyze_table(conn, schema: str, table: str) -> TableInfo:
             data_type=r["data_type"],
             is_primary_key=r["name"] in pk_set,
             ordinal_position=r["ordinal_position"],
+            is_generated_always=r["is_generated_always"],
         )
         for r in col_rows
     ]

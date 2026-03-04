@@ -3,21 +3,53 @@ SyncGuard: parallel bucket-hash validation and recursive pinpoint/repair.
 """
 
 import asyncio
+import json
 import logging
-from typing import Any, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Callable, List, Optional, Tuple
+from uuid import UUID
 
 import asyncpg
 
+from sync_guard.control_plane import (
+    ControlPlane,
+    RUN_STATUS_DIVERGED,
+    RUN_STATUS_FAILED,
+    RUN_STATUS_SUCCESS,
+)
 from sync_guard.exceptions import RepairError, SchemaError
 from sync_guard.hash_queries import (
     build_bucket_hash_query,
     build_bucket_hash_query_with_bounds,
+    build_fetch_row_query,
     build_row_count_query,
     build_upsert_sql,
 )
 from sync_guard.schema import TableInfo, analyze_table
 
 logger = logging.getLogger(__name__)
+
+# Optional callback (stage: str, detail: str) for human-readable progress (e.g. print to console)
+ProgressCallback = Callable[[str, str], None]
+
+
+def console_progress(stage: str, detail: str) -> None:
+    """Default progress callback that prints to stdout with a [SyncGuard] prefix."""
+    print(f"[SyncGuard] {stage}: {detail}")
+
+
+def _rows_equal(pub_row: asyncpg.Record, sub_row: asyncpg.Record, col_names: List[str]) -> bool:
+    """
+    Return True if the two rows have the same values for all columns.
+    Uses the same JSON-serializable normalization as the control plane so that
+    e.g. Decimal vs int or datetime with/without tz compare correctly.
+    """
+    pub_d = ControlPlane.record_to_jsonable(pub_row)
+    sub_d = ControlPlane.record_to_jsonable(sub_row)
+    for c in col_names:
+        if pub_d.get(c) != sub_d.get(c):
+            return False
+    return True
 
 # Default segment count for initial validation
 DEFAULT_NUM_SEGMENTS = 32
@@ -148,6 +180,10 @@ class SyncGuard:
         pk_lower: tuple,
         pk_upper: tuple,
         repaired: List[tuple],
+        *,
+        run_id: Optional[UUID] = None,
+        control_plane: Optional[ControlPlane] = None,
+        progress: Optional[ProgressCallback] = None,
     ) -> None:
         """
         Recursively narrow the range until we have at most REPAIR_BATCH_THRESHOLD
@@ -158,8 +194,14 @@ class SyncGuard:
         if count == 0:
             return
         if count <= self.repair_batch_threshold:
-            # Fetch all rows in range from publisher and upsert on subscriber
-            await self._repair_range(pk_lower, pk_upper, repaired)
+            await self._repair_range(
+                pk_lower,
+                pk_upper,
+                repaired,
+                run_id=run_id,
+                control_plane=control_plane,
+                progress=progress,
+            )
             return
 
         # Split and see which sub-segment(s) differ
@@ -179,37 +221,81 @@ class SyncGuard:
             sr = sub_by_seg.get(seg)
             if sr is None or pr["segment_hash"] != sr["segment_hash"]:
                 seg_lower, seg_upper = self._segment_bounds_from_row(pr)
-                await self._pinpoint_and_repair(seg_lower, seg_upper, repaired)
+                await self._pinpoint_and_repair(
+                    seg_lower,
+                    seg_upper,
+                    repaired,
+                    run_id=run_id,
+                    control_plane=control_plane,
+                    progress=progress,
+                )
 
     async def _repair_range(
         self,
         pk_lower: tuple,
         pk_upper: tuple,
         repaired: List[tuple],
+        *,
+        run_id: Optional[UUID] = None,
+        control_plane: Optional[ControlPlane] = None,
+        progress: Optional[ProgressCallback] = None,
     ) -> None:
         """
         Fetch all rows in the PK range from the publisher and upsert each
-        on the subscriber.
+        on the subscriber. Optionally log each repair to the control plane.
         """
         info = self.table_info
         pk_quoted = info.pk_columns_quoted()
-        pk_tuple = ", ".join(pk_quoted)
+        pk_tuple_sql = ", ".join(pk_quoted)
         n = len(pk_quoted)
         placeholders_low = ", ".join(f"${i+1}" for i in range(n))
         placeholders_high = ", ".join(f"${i + 1 + n}" for i in range(n))
-        where = f"({pk_tuple}) >= ({placeholders_low}) AND ({pk_tuple}) <= ({placeholders_high})"
+        where = f"({pk_tuple_sql}) >= ({placeholders_low}) AND ({pk_tuple_sql}) <= ({placeholders_high})"
         qual = info.qualified_name
         fetch_sql = f"SELECT * FROM {qual} WHERE {where} ORDER BY {info.pk_order_clause()}"
         rows = await self.publisher.fetch(fetch_sql, *pk_lower, *pk_upper)
         upsert_sql = build_upsert_sql(info)
+        fetch_row_sql = build_fetch_row_query(info)
         col_names = [c.name for c in info.columns]
+        pk_names = info.primary_key_columns
+
         for row in rows:
+            pk_vals = tuple(row[c] for c in pk_names)
             values = tuple(row[c] for c in col_names)
+
+            # Always fetch subscriber row: to skip upsert when already identical (avoids false positives
+            # from segment-boundary shifts when row counts differ) and for divergence_log when we do repair
+            sub_row = await self.subscriber.fetchrow(fetch_row_sql, *pk_vals)
+
+            # Skip if subscriber already has the same row (no actual divergence)
+            if sub_row is not None and _rows_equal(row, sub_row, col_names):
+                logger.debug("Skipping PK %s: subscriber row matches publisher", pk_vals)
+                continue
+
             try:
                 await self.subscriber.execute(upsert_sql, *values)
             except Exception as e:
-                raise RepairError(f"Upsert failed for PK {tuple(row[c] for c in info.primary_key_columns)}: {e}") from e
-            repaired.append(tuple(row[c] for c in info.primary_key_columns))
+                raise RepairError(f"Upsert failed for PK {pk_vals}: {e}") from e
+
+            repaired.append(pk_vals)
+            now = datetime.now(timezone.utc)
+
+            if control_plane and run_id:
+                pk_value_str = json.dumps(list(pk_vals))
+                pub_data = ControlPlane.record_to_jsonable(row)
+                sub_data = ControlPlane.record_to_jsonable(sub_row) if sub_row else None
+                await control_plane.log_divergence(
+                    run_id=run_id,
+                    pk_value=pk_value_str,
+                    publisher_data=pub_data,
+                    subscriber_data=sub_data,
+                    repair_sql=upsert_sql,
+                    repaired_at=now,
+                )
+
+            if progress:
+                progress("repaired", f"PK {pk_vals}")
+
         logger.info("Repaired %d row(s) in range %s..%s", len(rows), pk_lower, pk_upper)
 
 
@@ -219,14 +305,76 @@ async def validate_and_repair(
     table: str,
     *,
     num_segments: Optional[int] = None,
+    control_conn: Optional[asyncpg.Connection] = None,
+    control_plane: Optional[ControlPlane] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> List[tuple]:
     """
     Run validation; for every mismatched segment, recursively pinpoint and
     repair. Returns list of repaired primary key tuples.
+
+    If control_conn or control_plane is provided, writes to the syncguard
+    schema: inserts a validation run at start, logs each divergence to
+    divergence_log, and updates the run (status, finished_at, mismatch_count)
+    at end. Use a separate connection for the control DB so it does not
+    interfere with Publisher/Subscriber.
+
+    progress_callback(stage, detail) is called at key steps for human-readable
+    output (e.g. print to console).
     """
-    mismatches = await guard.validate(schema, table, num_segments=num_segments)
-    repaired: List[tuple] = []
-    for pub_row, _ in mismatches:
-        pk_lower, pk_upper = guard._segment_bounds_from_row(pub_row)
-        await guard._pinpoint_and_repair(pk_lower, pk_upper, repaired)
-    return repaired
+    table_name = f"{schema}.{table}"
+    cp = control_plane if control_plane is not None else (ControlPlane(control_conn) if control_conn else None)
+    run_id: Optional[UUID] = None
+    if cp:
+        run_id = await cp.start_run(table_name)
+        if progress_callback:
+            progress_callback("started", f"Run {run_id} for table {table_name}")
+
+    def progress(stage: str, detail: str) -> None:
+        if progress_callback:
+            progress_callback(stage, detail)
+
+    try:
+        if progress_callback:
+            progress_callback("schema", f"Analyzing table {table_name}...")
+        mismatches = await guard.validate(schema, table, num_segments=num_segments)
+
+        if progress_callback:
+            if not mismatches:
+                progress_callback("validation", "All segments match. No divergence.")
+            else:
+                progress_callback("validation", f"Found {len(mismatches)} segment(s) with hash mismatch.")
+
+        repaired: List[tuple] = []
+        if mismatches and progress_callback:
+            progress_callback("repair", "Pinpointing and repairing diverged rows...")
+
+        for pub_row, _ in mismatches:
+            pk_lower, pk_upper = guard._segment_bounds_from_row(pub_row)
+            await guard._pinpoint_and_repair(
+                pk_lower,
+                pk_upper,
+                repaired,
+                run_id=run_id,
+                control_plane=cp,
+                progress=progress_callback,
+            )
+
+        if cp and run_id is not None:
+            status = RUN_STATUS_DIVERGED if repaired else RUN_STATUS_SUCCESS
+            await cp.complete_run(run_id, status=status, mismatch_count=len(repaired))
+
+        if progress_callback:
+            if repaired:
+                progress_callback("done", f"Run finished: status={'diverged' if repaired else 'success'}, repaired {len(repaired)} row(s). PKs: {repaired[:10]}{'...' if len(repaired) > 10 else ''}")
+            else:
+                progress_callback("done", "Run finished: status=success, no repairs needed.")
+
+        return repaired
+    except Exception as e:
+        if cp and run_id is not None:
+            await cp.complete_run(run_id, status=RUN_STATUS_FAILED, mismatch_count=0)
+        if progress_callback:
+            progress_callback("error", str(e))
+        logger.exception("validate_and_repair failed")
+        raise
