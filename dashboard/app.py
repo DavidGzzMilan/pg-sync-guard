@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import psycopg2
 import streamlit as st
+from sqlalchemy import text
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -131,8 +132,8 @@ def fetch_runs(engine, table_filter: str | None = None, run_id_filter: str | Non
     if limit:
         sql += f" LIMIT {int(limit)}"
     if params:
-        return pd.read_sql(sql, engine, params=params)
-    return pd.read_sql(sql, engine)
+        return pd.read_sql(text(sql), engine, params=params)
+    return pd.read_sql(text(sql), engine)
 
 
 def fetch_divergences(engine, run_id: str) -> pd.DataFrame:
@@ -147,7 +148,7 @@ def fetch_divergences(engine, run_id: str) -> pd.DataFrame:
     ORDER BY log_id
     """
     try:
-        df = pd.read_sql(sql_full, engine, params=params)
+        df = pd.read_sql(text(sql_full), engine, params=params)
         df["is_resolved"] = df["resolved_at"].notna()
         return df
     except Exception:
@@ -157,7 +158,7 @@ def fetch_divergences(engine, run_id: str) -> pd.DataFrame:
         WHERE run_id = :run_id
         ORDER BY log_id
         """
-        df = pd.read_sql(sql, engine, params=params)
+        df = pd.read_sql(text(sql), engine, params=params)
         df["resolved_at"] = pd.NA
         df["is_resolved"] = False
         return df
