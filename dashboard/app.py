@@ -56,19 +56,27 @@ def get_validation_cmd() -> str:
 
 @contextmanager
 def control_db_connection():
-    """Yield a Control DB connection; always closed on exit."""
+    """Yield (psycopg2_conn, sqlalchemy_engine) for Control DB. Use engine for pd.read_sql to avoid pandas warnings."""
     dsn = get_control_dsn()
     if not dsn:
-        yield None
+        yield None, None
         return
     conn = None
+    engine = None
     try:
+        from sqlalchemy import create_engine
+        engine = create_engine(dsn)
         conn = psycopg2.connect(dsn)
-        yield conn
+        yield conn, engine
     finally:
         if conn is not None:
             try:
                 conn.close()
+            except Exception:
+                pass
+        if engine is not None:
+            try:
+                engine.dispose()
             except Exception:
                 pass
 
@@ -101,9 +109,9 @@ def fetch_monitored_tables(conn) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
-def fetch_runs(conn, table_filter: str | None = None, run_id_filter: str | None = None, limit: int | None = None) -> pd.DataFrame:
-    """Validation runs as DataFrame. Optional run_id_filter and limit (e.g. 10 for live log)."""
-    if conn is None:
+def fetch_runs(engine, table_filter: str | None = None, run_id_filter: str | None = None, limit: int | None = None) -> pd.DataFrame:
+    """Validation runs as DataFrame. Uses SQLAlchemy engine for pd.read_sql. Optional run_id_filter and limit."""
+    if engine is None:
         return pd.DataFrame()
     sql = f"""
     SELECT run_id, table_name, status, started_at, finished_at, mismatch_count
@@ -120,13 +128,13 @@ def fetch_runs(conn, table_filter: str | None = None, run_id_filter: str | None 
     if limit:
         sql += f" LIMIT {int(limit)}"
     if params:
-        return pd.read_sql(sql, conn, params=params)
-    return pd.read_sql(sql, conn)
+        return pd.read_sql(sql, engine, params=params)
+    return pd.read_sql(sql, engine)
 
 
-def fetch_divergences(conn, run_id: str) -> pd.DataFrame:
-    """Divergence log entries for a run. resolved_at / is_resolved included if columns exist."""
-    if conn is None:
+def fetch_divergences(engine, run_id: str) -> pd.DataFrame:
+    """Divergence log entries for a run. Uses SQLAlchemy engine. resolved_at / is_resolved included if columns exist."""
+    if engine is None:
         return pd.DataFrame()
     sql_full = f"""
     SELECT log_id, run_id, pk_value, publisher_data, subscriber_data, repair_sql, repaired_at, resolved_at
@@ -135,7 +143,7 @@ def fetch_divergences(conn, run_id: str) -> pd.DataFrame:
     ORDER BY log_id
     """
     try:
-        df = pd.read_sql(sql_full, conn, params=(run_id,))
+        df = pd.read_sql(sql_full, engine, params=(run_id,))
         df["is_resolved"] = df["resolved_at"].notna()
         return df
     except Exception:
@@ -145,7 +153,7 @@ def fetch_divergences(conn, run_id: str) -> pd.DataFrame:
         WHERE run_id = %s
         ORDER BY log_id
         """
-        df = pd.read_sql(sql, conn, params=(run_id,))
+        df = pd.read_sql(sql, engine, params=(run_id,))
         df["resolved_at"] = pd.NA
         df["is_resolved"] = False
         return df
@@ -354,7 +362,7 @@ def main():
             st.session_state.validation_finished_toast_shown = True
         st.session_state.validation_pid = None
 
-    with control_db_connection() as conn:
+    with control_db_connection() as (conn, engine):
         if conn is None:
             st.warning(
                 "Set **SYNCGUARD_CONTROL_DSN** or configure `control_database` in `.streamlit/secrets.toml` to connect to the Control database."
@@ -407,15 +415,15 @@ def main():
         current_run_id = st.session_state.get("current_run_id")
         with st.expander("🛠 Active Process Logs", expanded=False):
             if current_run_id:
-                last_runs = fetch_runs(conn, run_id_filter=current_run_id, limit=10)
+                last_runs = fetch_runs(engine, run_id_filter=current_run_id, limit=10)
             else:
-                last_runs = fetch_runs(conn, table_filter=table_filter, limit=10)
+                last_runs = fetch_runs(engine, table_filter=table_filter, limit=10)
             if last_runs.empty:
                 st.info("No validation runs yet.")
             else:
                 display = last_runs.copy()
                 display["run_id"] = display["run_id"].astype(str)
-                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.dataframe(display, width="stretch", hide_index=True)
             st.caption("Last 10 validation runs (filtered by selected run when one is chosen). Refresh to update.")
 
         # ----- Metrics (legacy-style) -----
@@ -429,7 +437,7 @@ def main():
             st.metric("Successful repairs", metrics["successful_repairs"])
 
         # ----- Active (running) validation runs -----
-        runs_df = fetch_runs(conn, table_filter)
+        runs_df = fetch_runs(engine, table_filter)
         running = runs_df[runs_df["status"] == "running"] if not runs_df.empty else pd.DataFrame()
         if not running.empty:
             with st.status("Validation run(s) in progress", expanded=True) as status:
@@ -445,7 +453,7 @@ def main():
         else:
             runs_df_display = runs_df.copy()
             runs_df_display["run_id"] = runs_df_display["run_id"].astype(str)
-            st.dataframe(runs_df_display, use_container_width=True, hide_index=True)
+            st.dataframe(runs_df_display, width="stretch", hide_index=True)
 
             run_options = runs_df[runs_df["status"].isin(("diverged", "running"))]
             if not run_options.empty:
@@ -462,7 +470,7 @@ def main():
                 selected_run_id = run_ids[selected_idx]
                 st.session_state.current_run_id = str(selected_run_id)
 
-                div_df = fetch_divergences(conn, str(selected_run_id))
+                div_df = fetch_divergences(engine, str(selected_run_id))
                 if div_df.empty:
                     st.info("No divergence log entries for this run.")
                 else:
@@ -478,7 +486,7 @@ def main():
                         display_df["resolved_at"] = display_df["resolved_at"].apply(
                             lambda x: x.strftime("%Y-%m-%d %H:%M") if hasattr(x, "strftime") and pd.notna(x) else ""
                         )
-                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    st.dataframe(display_df, width="stretch", hide_index=True)
 
                     subscriber_dsn = get_subscriber_dsn()
                     if not subscriber_dsn:
