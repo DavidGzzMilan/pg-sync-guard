@@ -110,20 +110,23 @@ def fetch_monitored_tables(conn) -> list[str]:
 
 
 def fetch_runs(engine, table_filter: str | None = None, run_id_filter: str | None = None, limit: int | None = None) -> pd.DataFrame:
-    """Validation runs as DataFrame. Uses SQLAlchemy engine for pd.read_sql. Optional run_id_filter and limit."""
+    """Validation runs as DataFrame. Uses SQLAlchemy engine for pd.read_sql (named params)."""
     if engine is None:
         return pd.DataFrame()
     sql = f"""
     SELECT run_id, table_name, status, started_at, finished_at, mismatch_count
     FROM {SCHEMA}.validation_runs
     """
-    params = []
+    conditions = []
+    params = {}
     if table_filter:
-        sql += " WHERE table_name = %s"
-        params.append(table_filter)
+        conditions.append("table_name = :table_filter")
+        params["table_filter"] = table_filter
     if run_id_filter:
-        sql += " AND run_id = %s" if params else " WHERE run_id = %s"
-        params.append(run_id_filter)
+        conditions.append("run_id = :run_id_filter")
+        params["run_id_filter"] = run_id_filter
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
     sql += " ORDER BY started_at DESC"
     if limit:
         sql += f" LIMIT {int(limit)}"
@@ -133,27 +136,28 @@ def fetch_runs(engine, table_filter: str | None = None, run_id_filter: str | Non
 
 
 def fetch_divergences(engine, run_id: str) -> pd.DataFrame:
-    """Divergence log entries for a run. Uses SQLAlchemy engine. resolved_at / is_resolved included if columns exist."""
+    """Divergence log entries for a run. Uses SQLAlchemy engine (named params). resolved_at / is_resolved if columns exist."""
     if engine is None:
         return pd.DataFrame()
+    params = {"run_id": run_id}
     sql_full = f"""
     SELECT log_id, run_id, pk_value, publisher_data, subscriber_data, repair_sql, repaired_at, resolved_at
     FROM {SCHEMA}.divergence_log
-    WHERE run_id = %s
+    WHERE run_id = :run_id
     ORDER BY log_id
     """
     try:
-        df = pd.read_sql(sql_full, engine, params=(run_id,))
+        df = pd.read_sql(sql_full, engine, params=params)
         df["is_resolved"] = df["resolved_at"].notna()
         return df
     except Exception:
         sql = f"""
         SELECT log_id, run_id, pk_value, publisher_data, subscriber_data, repair_sql, repaired_at
         FROM {SCHEMA}.divergence_log
-        WHERE run_id = %s
+        WHERE run_id = :run_id
         ORDER BY log_id
         """
-        df = pd.read_sql(sql, engine, params=(run_id,))
+        df = pd.read_sql(sql, engine, params=params)
         df["resolved_at"] = pd.NA
         df["is_resolved"] = False
         return df
