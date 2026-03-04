@@ -174,6 +174,7 @@ def fetch_metrics(conn, table_filter: str | None = None) -> dict:
             cur.execute(sql_active, params if params else None)
             active_divergences = cur.fetchone()[0]
         except Exception:
+            conn.rollback()
             sql_active = f"""
             SELECT COUNT(*) FROM {SCHEMA}.divergence_log d
             JOIN {SCHEMA}.validation_runs r ON r.run_id = d.run_id
@@ -201,7 +202,7 @@ def fetch_metrics(conn, table_filter: str | None = None) -> dict:
 
 
 def fetch_health_meter(conn) -> dict:
-    """Overall Sync % and Pending Repairs for Health Meter. Uses resolved_at IS NULL as 'not resolved'."""
+    """Overall Sync % and Pending Repairs for Health Meter. Tries resolved_at then is_resolved; rolls back on error so fallbacks run in a clean transaction."""
     if conn is None:
         return {"total_tables": 0, "diverged_tables": 0, "sync_pct": 100.0, "pending_repairs": 0}
     with conn.cursor() as cur:
@@ -218,18 +219,29 @@ def fetch_health_meter(conn) -> dict:
             """)
             diverged_tables = cur.fetchone()[0] or 0
         except Exception:
-            cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log")
-            diverged_tables = cur.fetchone()[0] or 0
+            conn.rollback()
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log")
+                diverged_tables = cur.fetchone()[0] or 0
+            except Exception:
+                conn.rollback()
+                diverged_tables = 0
         try:
-            cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log WHERE (is_resolved IS NULL OR is_resolved = false)")
+            cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log WHERE resolved_at IS NULL")
             pending_repairs = cur.fetchone()[0] or 0
         except Exception:
+            conn.rollback()
             try:
-                cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log WHERE resolved_at IS NULL")
+                cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log WHERE (is_resolved IS NULL OR is_resolved = false)")
                 pending_repairs = cur.fetchone()[0] or 0
             except Exception:
-                cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log")
-                pending_repairs = cur.fetchone()[0] or 0
+                conn.rollback()
+                try:
+                    cur.execute(f"SELECT COUNT(*) FROM {SCHEMA}.divergence_log")
+                    pending_repairs = cur.fetchone()[0] or 0
+                except Exception:
+                    conn.rollback()
+                    pending_repairs = 0
 
     if total_tables == 0:
         sync_pct = 100.0
