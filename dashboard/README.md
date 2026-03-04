@@ -25,6 +25,7 @@ Streamlit UI to inspect validation runs and divergence logs from the Control dat
    ```bash
    export SYNCGUARD_CONTROL_DSN="postgresql://user:pass@host:5432/control_db"
    export SYNCGUARD_SUBSCRIBER_DSN="postgresql://user:pass@host:5433/sub_db"  # optional
+   export SYNCGUARD_VALIDATION_CMD="python main.py"  # optional; command for "Launch Full Validation"
    ```
 
    **Streamlit secrets** (`.streamlit/secrets.toml`)
@@ -76,9 +77,11 @@ streamlit run dashboard/app.py --server.port 8502
 
 ## Features
 
+- **Launch Full Validation**: Button runs `python main.py` (or `SYNCGUARD_VALIDATION_CMD` / `validation_command` in secrets) as a background subprocess. PID is stored in session state so only one run at a time. Toasts when the job starts and when it finishes.
+- **Health meter**: Overall Sync % (100 - diverged_tables/total_tables) and Pending Repairs (count where `resolved_at` IS NULL or `is_resolved` is false).
+- **Live execution log**: Expandable "Active Process Logs" shows the last 10 validation runs (optionally filtered by the selected run).
 - **Sidebar**: Filter by monitored table (from `validation_runs.table_name`).
-- **Metrics**: Total checks, active divergences (unresolved), successful repairs.
-- **Validation runs**: Table of runs (run_id, table_name, status, started_at, finished_at, mismatch_count).
-- **Active runs**: If any run has `status = 'running'`, a status block is shown; refresh the page to update.
-- **Mismatches**: Select a diverged run to see its `divergence_log` rows. Each entry can be expanded to view publisher/subscriber data and the repair SQL.
-- **Repair**: With `SYNCGUARD_SUBSCRIBER_DSN` (or `subscriber_database` in secrets), a "Repair" button runs the stored SQL on the subscriber and, if the column exists, sets `resolved_at` for that log row.
+- **Metrics**: Total checks, active divergences, successful repairs.
+- **Validation runs**: Table of runs; select a diverged run to see mismatches.
+- **Repair console**: For each unresolved divergence: **Manual Review** (repair SQL in a `st.code` block, publisher/subscriber data) and **Execute Repair** (runs that SQL on the Subscriber and sets `resolved_at` / `is_resolved` in the Control DB).
+- **Control DB**: All Control DB access uses a context manager so connections are closed and do not hang.
