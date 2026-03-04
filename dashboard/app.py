@@ -353,11 +353,15 @@ def main():
     st.set_page_config(page_title="SyncGuard Dashboard", layout="wide")
     st.title("SyncGuard Dashboard — Control Center")
 
-    # Session state for subprocess PID (prevent multiple simultaneous runs)
+    # Session state for subprocess PID and persistent action feedback
     if "validation_pid" not in st.session_state:
         st.session_state.validation_pid = None
     if "validation_finished_toast_shown" not in st.session_state:
         st.session_state.validation_finished_toast_shown = False
+    if "last_action_message" not in st.session_state:
+        st.session_state.last_action_message = None
+    if "last_action_type" not in st.session_state:
+        st.session_state.last_action_type = None  # "success" or "error"
 
     # Detect finished background job and toast once
     pid = st.session_state.validation_pid
@@ -373,6 +377,17 @@ def main():
                 "Set **SYNCGUARD_CONTROL_DSN** or configure `control_database` in `.streamlit/secrets.toml` to connect to the Control database."
             )
             st.stop()
+
+        # Persistent feedback from previous run (e.g. after Repair or Launch)
+        if st.session_state.last_action_message:
+            msg = st.session_state.last_action_message
+            typ = st.session_state.last_action_type or "success"
+            if typ == "success":
+                st.success(msg)
+            else:
+                st.error(msg)
+            st.session_state.last_action_message = None
+            st.session_state.last_action_type = None
 
         # Sidebar: monitored tables
         tables = fetch_monitored_tables(conn)
@@ -400,8 +415,13 @@ def main():
             if proc is not None:
                 st.session_state.validation_pid = proc.pid
                 st.session_state.validation_finished_toast_shown = False
+                st.session_state.last_action_message = f"Validation started in background (PID {proc.pid})."
+                st.session_state.last_action_type = "success"
                 st.toast("Background validation started.", icon="🚀")
-                st.rerun()
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
 
         if validation_running:
             st.sidebar.caption(f"Validation running (PID {pid}). Refresh to update.")
@@ -515,11 +535,12 @@ def main():
                                     st.caption("Subscriber (before):")
                                     st.json(row["subscriber_data"])
 
-                                if st.button("Execute Repair", key=f"repair_{log_id}"):
+                                if st.button("Execute Repair", key=f"repair_{selected_run_id}_{log_id}"):
                                     try:
                                         sub_conn = get_subscriber_conn()
                                         if not sub_conn:
-                                            st.error("Subscriber connection not available.")
+                                            st.session_state.last_action_message = "Subscriber connection not available."
+                                            st.session_state.last_action_type = "error"
                                         else:
                                             pub_data = row["publisher_data"]
                                             if isinstance(pub_data, str):
@@ -527,12 +548,22 @@ def main():
                                             execute_repair(sub_conn, row["repair_sql"], pub_data)
                                             sub_conn.close()
                                             mark_log_resolved(conn, log_id)
+                                            st.session_state.last_action_message = f"Repair executed for log_id {log_id}."
+                                            st.session_state.last_action_type = "success"
                                             st.toast(f"Repair executed for log_id {log_id}.", icon="✅")
-                                            st.success(f"Repair executed for log_id {log_id}.")
+                                        try:
                                             st.rerun()
+                                        except Exception:
+                                            pass
                                     except Exception as e:
+                                        st.session_state.last_action_message = f"Repair failed: {e}"
+                                        st.session_state.last_action_type = "error"
                                         st.exception(e)
                                         st.toast(f"Repair failed: {e}", icon="❌")
+                                        try:
+                                            st.rerun()
+                                        except Exception:
+                                            pass
 
         if not running.empty and st.button("Refresh"):
             st.rerun()
