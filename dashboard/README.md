@@ -25,7 +25,7 @@ Streamlit UI to inspect validation runs and divergence logs from the Control dat
    ```bash
    export SYNCGUARD_CONTROL_DSN="postgresql://user:pass@host:5432/control_db"
    export SYNCGUARD_SUBSCRIBER_DSN="postgresql://user:pass@host:5433/sub_db"  # optional
-   export SYNCGUARD_VALIDATION_CMD="python main.py"  # optional; command for "Launch Full Validation"
+   export SYNCGUARD_VALIDATION_CMD="python main.py --validate-only"  # optional; default runs validate-only so you can repair from the UI
    ```
 
    **Streamlit secrets** (`.streamlit/secrets.toml`)
@@ -75,9 +75,16 @@ Or with a custom port:
 streamlit run dashboard/app.py --server.port 8502
 ```
 
+## Validate-only vs one-shot repair
+
+The main process can run in two ways:
+
+- **Validate-only** (default when launched from the dashboard): finds divergences, writes them to the Control Plane (`divergence_log` with `repaired_at` NULL), and exits. You then use the dashboard’s **Execute Repair** to apply repairs asynchronously. Set `SYNCGUARD_VALIDATION_CMD="python main.py --validate-only"` (or leave the default).
+- **One-shot**: run `python main.py` without `--validate-only` (or use `validate_and_repair` in code) to validate and repair in a single process; repairs are applied immediately and logged with `repaired_at` set.
+
 ## Features
 
-- **Launch Full Validation**: Button runs `python main.py` (or `SYNCGUARD_VALIDATION_CMD` / `validation_command` in secrets) as a background subprocess. PID is stored in session state so only one run at a time. Toasts when the job starts and when it finishes.
+- **Launch Full Validation**: Button runs the validation command (default: `python main.py --validate-only`) as a background subprocess. PID is stored in session state so only one run at a time. Toasts when the job starts and when it finishes.
 - **Health meter**: Overall Sync % (100 - diverged_tables/total_tables) and Pending Repairs (count where `resolved_at` IS NULL).
 - **Live execution log**: Expandable "Active Process Logs" shows the last 10 validation runs (optionally filtered by the selected run).
 - **Sidebar**: Filter by monitored table (from `validation_runs.table_name`).

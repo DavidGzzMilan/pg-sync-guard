@@ -48,10 +48,10 @@ GRANT USAGE, SELECT ON SEQUENCE syncguard.divergence_log_log_id_seq TO syncguard
 
 ## Usage
 
-Use a **separate connection** for the control database. Pass it as `control_conn` to `validate_and_repair`; SyncGuard will:
+Use a **separate connection** for the control database. Pass it as `control_conn` to `validate_and_repair` or `validate_only`; SyncGuard will:
 
 1. **At start**: insert a row into `validation_runs` with `status = 'running'`.
-2. **For each repaired row**: insert into `divergence_log` (pk_value, publisher_data, subscriber_data, repair_sql, repaired_at).
+2. **For each diverged row**: insert into `divergence_log` (pk_value, publisher_data, subscriber_data, repair_sql). If the run applies repairs, `repaired_at` is set; if you use **validate_only** (no repair in-process), `repaired_at` is NULL and repairs can be run later from the dashboard.
 3. **At end**: update the run with `status` ('success' or 'diverged'), `finished_at`, and `mismatch_count`.
 
 Example:

@@ -44,10 +44,10 @@ def get_subscriber_dsn() -> str:
 
 
 def get_validation_cmd() -> str:
-    """Command to run full validation (e.g. python main.py)."""
+    """Command to run validation (default: validate-only so repairs can be run from the dashboard)."""
     if hasattr(st, "secrets") and st.secrets.get("validation_command"):
         return st.secrets["validation_command"]
-    return os.environ.get("SYNCGUARD_VALIDATION_CMD", "python main.py")
+    return os.environ.get("SYNCGUARD_VALIDATION_CMD", "python main.py --validate-only")
 
 
 # -----------------------------------------------------------------------------

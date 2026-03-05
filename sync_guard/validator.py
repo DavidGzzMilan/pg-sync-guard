@@ -184,10 +184,12 @@ class SyncGuard:
         run_id: Optional[UUID] = None,
         control_plane: Optional[ControlPlane] = None,
         progress: Optional[ProgressCallback] = None,
+        apply_repair: bool = True,
     ) -> None:
         """
         Recursively narrow the range until we have at most REPAIR_BATCH_THRESHOLD
-        rows, then fetch from publisher and upsert on subscriber.
+        rows, then fetch from publisher and (if apply_repair) upsert on subscriber,
+        else only log to control plane.
         """
         info = self.table_info
         count = await self._row_count_in_range(pk_lower, pk_upper)
@@ -201,6 +203,7 @@ class SyncGuard:
                 run_id=run_id,
                 control_plane=control_plane,
                 progress=progress,
+                apply_repair=apply_repair,
             )
             return
 
@@ -228,6 +231,7 @@ class SyncGuard:
                     run_id=run_id,
                     control_plane=control_plane,
                     progress=progress,
+                    apply_repair=apply_repair,
                 )
 
     async def _repair_range(
@@ -239,10 +243,12 @@ class SyncGuard:
         run_id: Optional[UUID] = None,
         control_plane: Optional[ControlPlane] = None,
         progress: Optional[ProgressCallback] = None,
+        apply_repair: bool = True,
     ) -> None:
         """
-        Fetch all rows in the PK range from the publisher and upsert each
-        on the subscriber. Optionally log each repair to the control plane.
+        Fetch all rows in the PK range from the publisher; if apply_repair, upsert
+        each on the subscriber. Always log each divergence to the control plane
+        (repaired_at=now only when apply_repair, else None for validate-only).
         """
         info = self.table_info
         pk_quoted = info.pk_columns_quoted()
@@ -263,22 +269,20 @@ class SyncGuard:
             pk_vals = tuple(row[c] for c in pk_names)
             values = tuple(row[c] for c in col_names)
 
-            # Always fetch subscriber row: to skip upsert when already identical (avoids false positives
-            # from segment-boundary shifts when row counts differ) and for divergence_log when we do repair
             sub_row = await self.subscriber.fetchrow(fetch_row_sql, *pk_vals)
 
-            # Skip if subscriber already has the same row (no actual divergence)
             if sub_row is not None and _rows_equal(row, sub_row, col_names):
                 logger.debug("Skipping PK %s: subscriber row matches publisher", pk_vals)
                 continue
 
-            try:
-                await self.subscriber.execute(upsert_sql, *values)
-            except Exception as e:
-                raise RepairError(f"Upsert failed for PK {pk_vals}: {e}") from e
+            if apply_repair:
+                try:
+                    await self.subscriber.execute(upsert_sql, *values)
+                except Exception as e:
+                    raise RepairError(f"Upsert failed for PK {pk_vals}: {e}") from e
 
             repaired.append(pk_vals)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc) if apply_repair else None
 
             if control_plane and run_id:
                 pk_value_str = json.dumps(list(pk_vals))
@@ -294,9 +298,15 @@ class SyncGuard:
                 )
 
             if progress:
-                progress("repaired", f"PK {pk_vals}")
+                progress("repaired" if apply_repair else "diverged", f"PK {pk_vals}")
 
-        logger.info("Repaired %d row(s) in range %s..%s", len(rows), pk_lower, pk_upper)
+        logger.info(
+            "%s %d row(s) in range %s..%s",
+            "Repaired" if apply_repair else "Logged",
+            len(rows),
+            pk_lower,
+            pk_upper,
+        )
 
 
 async def validate_and_repair(
@@ -308,16 +318,20 @@ async def validate_and_repair(
     control_conn: Optional[asyncpg.Connection] = None,
     control_plane: Optional[ControlPlane] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    repair: bool = True,
 ) -> List[tuple]:
     """
     Run validation; for every mismatched segment, recursively pinpoint and
-    repair. Returns list of repaired primary key tuples.
+    optionally repair. Returns list of primary key tuples (repaired or only logged).
+
+    When repair=True (default): applies upsert on the subscriber and logs with
+    repaired_at=now. When repair=False (validate-only): only logs to the control
+    plane (repaired_at=None) so the dashboard can run repairs asynchronously.
 
     If control_conn or control_plane is provided, writes to the syncguard
     schema: inserts a validation run at start, logs each divergence to
     divergence_log, and updates the run (status, finished_at, mismatch_count)
-    at end. Use a separate connection for the control DB so it does not
-    interfere with Publisher/Subscriber.
+    at end.
 
     progress_callback(stage, detail) is called at key steps for human-readable
     output (e.g. print to console).
@@ -347,7 +361,10 @@ async def validate_and_repair(
 
         repaired: List[tuple] = []
         if mismatches and progress_callback:
-            progress_callback("repair", "Pinpointing and repairing diverged rows...")
+            progress_callback(
+                "repair" if repair else "diverged",
+                "Pinpointing and " + ("repairing" if repair else "logging") + " diverged rows...",
+            )
 
         for pub_row, _ in mismatches:
             pk_lower, pk_upper = guard._segment_bounds_from_row(pub_row)
@@ -358,6 +375,7 @@ async def validate_and_repair(
                 run_id=run_id,
                 control_plane=cp,
                 progress=progress_callback,
+                apply_repair=repair,
             )
 
         if cp and run_id is not None:
@@ -366,9 +384,10 @@ async def validate_and_repair(
 
         if progress_callback:
             if repaired:
-                progress_callback("done", f"Run finished: status={'diverged' if repaired else 'success'}, repaired {len(repaired)} row(s). PKs: {repaired[:10]}{'...' if len(repaired) > 10 else ''}")
+                verb = "repaired" if repair else "logged"
+                progress_callback("done", f"Run finished: status={'diverged' if repaired else 'success'}, {verb} {len(repaired)} row(s). PKs: {repaired[:10]}{'...' if len(repaired) > 10 else ''}")
             else:
-                progress_callback("done", "Run finished: status=success, no repairs needed.")
+                progress_callback("done", "Run finished: status=success, no divergences.")
 
         return repaired
     except Exception as e:
@@ -378,3 +397,30 @@ async def validate_and_repair(
             progress_callback("error", str(e))
         logger.exception("validate_and_repair failed")
         raise
+
+
+async def validate_only(
+    guard: SyncGuard,
+    schema: str,
+    table: str,
+    *,
+    num_segments: Optional[int] = None,
+    control_conn: Optional[asyncpg.Connection] = None,
+    control_plane: Optional[ControlPlane] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> List[tuple]:
+    """
+    Run validation and log divergences to the control plane without applying
+    repairs. Use this when the dashboard (or another process) will run repairs
+    asynchronously. Returns list of diverged primary key tuples that were logged.
+    """
+    return await validate_and_repair(
+        guard,
+        schema,
+        table,
+        num_segments=num_segments,
+        control_conn=control_conn,
+        control_plane=control_plane,
+        progress_callback=progress_callback,
+        repair=False,
+    )
