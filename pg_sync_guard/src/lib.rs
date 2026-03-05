@@ -7,6 +7,7 @@
 use std::ffi::{CStr, CString};
 use std::time::Duration;
 
+use pgrx::datum::DatumWithOid;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags};
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
@@ -184,7 +185,7 @@ fn process_one_chunk(chunk_size: i64) -> Result<(), Box<dyn std::error::Error + 
     ";
 
     let (schema_name, table_name, pk_column, last_pk): (Option<String>, Option<String>, Option<String>, Option<i64>) =
-        Spi::connect_mut(|client| {
+        Spi::connect_mut(|client| -> spi::Result<(Option<String>, Option<String>, Option<String>, Option<i64>)> {
             let table = client.update(get_table_sql, Some(1), &[])?;
             if table.is_empty() {
                 return Ok((None, None, None, None));
