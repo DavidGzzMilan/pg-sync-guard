@@ -1,16 +1,17 @@
-//! SyncGuard: Background worker for bucket-based hash validation of replicated tables.
+//! SyncGuard: dynamic per-database background worker for bucket-based hash
+//! validation of monitored tables.
 //!
-//! `CREATE EXTENSION pg_sync_guard` creates the required `syncguard` schema objects:
-//!   - `syncguard.monitored_tables`
-//!   - `syncguard.hash_catalog`
+//! `CREATE EXTENSION pg_sync_guard` creates the required `syncguard` schema
+//! objects. Start a worker for the current database with:
+//! `SELECT syncguard_start_worker();`
 
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::time::Duration;
 
-use pgrx::datum::DatumWithOid;
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags};
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::*;
+use pgrx::datum::DatumWithOid;
 use pgrx::spi::{quote_identifier, quote_qualified_identifier};
 
 pgrx::pg_module_magic!();
@@ -41,22 +42,10 @@ extension_sql!(
 
 extension_sql!(
     r#"
-    DO $$
-    BEGIN
-        -- Persist the target database name so the static background worker
-        -- knows which database to connect to after restart.
-        EXECUTE format(
-            'ALTER DATABASE %I SET syncguard.database_name = %L',
-            current_database(),
-            current_database()
-        );
-
-        -- Also set it for the current session immediately after CREATE EXTENSION.
-        PERFORM set_config('syncguard.database_name', current_database(), false);
-    END
-    $$;
+    SELECT syncguard_start_worker();
     "#,
-    name = "syncguard_set_database_name",
+    name = "syncguard_autostart_worker",
+    requires = [syncguard_start_worker],
     finalize
 );
 
@@ -64,25 +53,28 @@ extension_sql!(
 // GUCs
 // ---------------------------------------------------------------------------
 
-static SYNCGUARD_DATABASE_NAME: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
-
 static SYNCGUARD_NAPTIME: GucSetting<i32> = GucSetting::<i32>::new(60);
 static SYNCGUARD_NAPTIME_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
 static SYNCGUARD_CHUNK_SIZE: GucSetting<i32> = GucSetting::<i32>::new(5000);
 
+fn current_database_name() -> Option<String> {
+    unsafe {
+        let dbid = pg_sys::MyDatabaseId;
+        if dbid == pg_sys::InvalidOid {
+            return None;
+        }
+
+        let dbname_ptr = pg_sys::get_database_name(dbid);
+        if dbname_ptr.is_null() {
+            return None;
+        }
+
+        Some(CStr::from_ptr(dbname_ptr).to_string_lossy().into_owned())
+    }
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
-    let name = CStr::from_bytes_with_nul(b"syncguard.database_name\0").unwrap();
-    GucRegistry::define_string_guc(
-        name,
-        CStr::from_bytes_with_nul(b"Database to connect for SyncGuard worker\0").unwrap(),
-        CStr::from_bytes_with_nul(b"Must be set for the background worker to run.\0").unwrap(),
-        &SYNCGUARD_DATABASE_NAME,
-        GucContext::Sighup,
-        GucFlags::default(),
-    );
-
     let name = CStr::from_bytes_with_nul(b"syncguard.naptime\0").unwrap();
     GucRegistry::define_int_guc(
         name,
@@ -91,7 +83,7 @@ pub extern "C-unwind" fn _PG_init() {
         &SYNCGUARD_NAPTIME,
         1,
         86400,
-        GucContext::Sighup,
+        GucContext::Suset,
         GucFlags::default(),
     );
 
@@ -103,7 +95,7 @@ pub extern "C-unwind" fn _PG_init() {
         &SYNCGUARD_NAPTIME_MS,
         0,
         60000,
-        GucContext::Sighup,
+        GucContext::Suset,
         GucFlags::default(),
     );
 
@@ -115,34 +107,105 @@ pub extern "C-unwind" fn _PG_init() {
         &SYNCGUARD_CHUNK_SIZE,
         100,
         1_000_000,
-        GucContext::Sighup,
+        GucContext::Suset,
         GucFlags::default(),
     );
-
-    BackgroundWorkerBuilder::new("SyncGuard Worker")
-        .set_function("syncguard_worker_main")
-        .set_library("pg_sync_guard")
-        .enable_spi_access()
-        .set_start_time(BgWorkerStartTime::ConsistentState)
-        .load();
 }
 
+#[pg_extern]
+fn syncguard_worker_running() -> bool {
+    let dbname = match current_database_name() {
+        Some(dbname) => dbname,
+        None => return false,
+    };
+
+    let sql = "
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_stat_activity
+            WHERE datname = $1
+              AND backend_type = 'SyncGuard Worker'
+        )
+    ";
+    let args = [DatumWithOid::from(dbname.as_str())];
+
+    match Spi::get_one_with_args::<bool>(sql, &args) {
+        Ok(Some(is_running)) => is_running,
+        _ => false,
+    }
+}
+
+#[pg_extern]
+fn syncguard_start_worker() -> String {
+    if syncguard_worker_running() {
+        return "SyncGuard Worker already running for current database".to_string();
+    }
+
+    let dbname = match current_database_name() {
+        Some(dbname) => dbname,
+        None => return "Could not determine current database".to_string(),
+    };
+
+    let worker_name = format!("SyncGuard Worker [{}]", dbname);
+    let handle = BackgroundWorkerBuilder::new(&worker_name)
+        .set_type("SyncGuard Worker")
+        .set_function("syncguard_worker_main")
+        .set_library("pg_sync_guard")
+        .set_extra(&dbname)
+        .set_notify_pid(unsafe { pg_sys::MyProcPid })
+        .enable_spi_access()
+        .set_start_time(BgWorkerStartTime::ConsistentState)
+        .load_dynamic();
+
+    match handle {
+        Ok(handle) => match handle.wait_for_startup() {
+            Ok(pid) => format!("Started SyncGuard Worker for database '{}' with pid {}", dbname, pid),
+            Err(status) => format!(
+                "SyncGuard Worker registration succeeded for database '{}' but startup status was {:?}",
+                dbname, status
+            ),
+        },
+        Err(_) => format!("Failed to register SyncGuard Worker for database '{}'", dbname),
+    }
+}
+
+#[pg_extern]
+fn syncguard_stop_worker() -> String {
+    let dbname = match current_database_name() {
+        Some(dbname) => dbname,
+        None => return "Could not determine current database".to_string(),
+    };
+
+    let sql = "
+        SELECT count(*)
+        FROM pg_stat_activity
+        WHERE datname = $1
+          AND backend_type = 'SyncGuard Worker'
+          AND pg_terminate_backend(pid)
+    ";
+    let args = [DatumWithOid::from(dbname.as_str())];
+
+    match Spi::get_one_with_args::<i64>(sql, &args) {
+        Ok(Some(terminated)) => format!(
+            "Requested shutdown for {} SyncGuard Worker(s) in database '{}'",
+            terminated, dbname
+        ),
+        _ => format!("Could not stop SyncGuard Worker in database '{}'", dbname),
+    }
+}
+
+#[unsafe(no_mangle)]
 #[pg_guard]
 pub extern "C-unwind" fn syncguard_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    let dbname = match SYNCGUARD_DATABASE_NAME.get().as_ref().and_then(|c| c.to_str().ok()) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => {
-            pgrx::warning!(
-                "SyncGuard Worker: syncguard.database_name not set; idle"
-            );
-            while BackgroundWorker::wait_latch(Some(Duration::from_secs(60))) {}
-            return;
-        }
-    };
+    let dbname = BackgroundWorker::get_extra();
+    if dbname.is_empty() {
+        pgrx::warning!("SyncGuard Worker: no target database provided");
+        return;
+    }
 
-    BackgroundWorker::connect_worker_to_spi(Some(&dbname), None);
+    BackgroundWorker::connect_worker_to_spi(Some(dbname), None);
 
     let naptime_secs = SYNCGUARD_NAPTIME.get().max(1);
     let naptime_ms = SYNCGUARD_NAPTIME_MS.get().max(0) as u64;
