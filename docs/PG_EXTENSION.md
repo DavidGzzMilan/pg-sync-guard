@@ -69,6 +69,7 @@ Registration does the following:
 - resets prior bucket state for that table
 - initializes `syncguard.worker_state`
 - installs a row-level trigger on the target table so future changes mark buckets dirty
+- enables that trigger as `ALWAYS`, so it also fires for changes applied by logical replication on the subscriber
 
 ## How bucket hashes are used
 

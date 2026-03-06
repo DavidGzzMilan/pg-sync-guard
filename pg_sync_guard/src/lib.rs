@@ -238,6 +238,8 @@ fn install_dirty_trigger(schema_name: &str, table_name: &str) -> Result<(), DynE
         AFTER INSERT OR UPDATE OR DELETE ON {qualified_table}
         FOR EACH ROW
         EXECUTE FUNCTION syncguard.mark_dirty_trigger();
+        ALTER TABLE {qualified_table}
+            ENABLE ALWAYS TRIGGER syncguard_dirty_bucket_trigger;
         "
     );
     Spi::run(&sql)?;
