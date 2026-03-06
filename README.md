@@ -1,6 +1,11 @@
 # pg-sync-guard
 
-Validate data consistency between a PostgreSQL Logical Replication **Publisher** and **Subscriber** using bucket hashing, then pinpoint and repair mismatches.
+SyncGuard currently has two complementary pieces:
+
+- a **Python validator/repair CLI** in `sync_guard/` for comparing Publisher and Subscriber directly, logging divergences, and planning or applying repairs
+- a **PostgreSQL extension** in `pg_sync_guard/` that runs inside each database and maintains stable per-bucket hashes for local tables
+
+The overall goal is to validate data consistency between a PostgreSQL Logical Replication **Publisher** and **Subscriber** efficiently, even for very large tables.
 
 ## Features
 
@@ -8,9 +13,27 @@ Validate data consistency between a PostgreSQL Logical Replication **Publisher**
 - **Bucket hash validation**: Splits the table into \(N\) segments by PK order, computes a deterministic per-segment hash with `md5(row_to_json(...))` and `string_agg(..., '' ORDER BY pk)`, runs the same query on both sides in parallel, and compares results.
 - **Pinpoint & repair**: On mismatch, recursively narrows the segment (same hash query restricted to the segment’s PK range with \(N=2\)) until the range has at most a small batch of rows; then fetches those rows from the Publisher and runs `INSERT ... ON CONFLICT DO UPDATE` on the Subscriber.
 
+## PostgreSQL extension
+
+The newer extension-based architecture is documented in **[docs/PG_EXTENSION.md](docs/PG_EXTENSION.md)**.
+
+At a high level:
+
+- install `pg_sync_guard` on **both** Publisher and Subscriber
+- register monitored tables locally with `syncguard_register_table(...)`
+- let the extension worker maintain **stable per-bucket hashes** in `syncguard.bucket_catalog`
+- have an external CLI fetch and compare those hashes across both sides
+- persist verification history and divergences in the Control Plane if desired
+
+This is the preferred direction for large-table efficiency because the extension can keep a **dirty bucket queue** and usually recompute only the buckets affected by row changes.
+
 ## Database user privileges
 
-The role used to connect to Publisher and Subscriber needs specific grants (read-only on Publisher; read + insert/update on Subscriber for repair). See **[docs/REQUIRED_GRANTS.md](docs/REQUIRED_GRANTS.md)** for the SQL definitions.
+The role used to connect to Publisher and Subscriber needs specific grants. See **[docs/REQUIRED_GRANTS.md](docs/REQUIRED_GRANTS.md)** for:
+
+- Python validator / repair grants
+- Control Plane grants
+- extension-side grants for reading `syncguard.bucket_catalog` and registering monitored tables
 
 ## Control Plane (optional)
 
@@ -33,7 +56,7 @@ pip install -e .
 pip install -r requirements.txt
 ```
 
-## Quick usage
+## Python validator quick usage
 
 ```python
 import asyncio
@@ -50,6 +73,22 @@ async def main():
     await sub.close()
 
 asyncio.run(main())
+```
+
+## Extension quick usage
+
+See **[docs/PG_EXTENSION.md](docs/PG_EXTENSION.md)** for the full extension workflow. Minimal example:
+
+```sql
+CREATE EXTENSION pg_sync_guard;
+
+SELECT syncguard_register_table('public', 'my_table', 'id', 5000);
+
+SELECT syncguard_worker_running();
+
+SELECT *
+FROM syncguard.bucket_catalog
+ORDER BY schema_name, table_name, bucket_id;
 ```
 
 ## Class structure
