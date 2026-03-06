@@ -27,7 +27,9 @@ extension_sql!(
         PRIMARY KEY (schema_name, table_name)
     );
 
-    CREATE TABLE IF NOT EXISTS syncguard.hash_catalog (
+    -- Runtime scan state is reconstructable, so keep it UNLOGGED to avoid
+    -- generating WAL for every chunk update.
+    CREATE UNLOGGED TABLE IF NOT EXISTS syncguard.hash_catalog (
         schema_name      TEXT NOT NULL,
         table_name       TEXT NOT NULL,
         last_pk_checked  BIGINT NOT NULL DEFAULT 0,
@@ -236,7 +238,9 @@ pub extern "C-unwind" fn syncguard_worker_main(_arg: pg_sys::Datum) {
 
 /// Select next table (oldest last_checked_at), get last_pk_checked, run hash chunk, update catalog.
 fn process_one_chunk(chunk_size: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Get next monitored table (oldest last_checked_at or any without a catalog row)
+    // Get next monitored table (oldest last_checked_at or any without a catalog row).
+    // If hash_catalog was truncated after crash recovery (UNLOGGED table), the LEFT JOIN
+    // + COALESCE(last_pk_checked, 0) naturally restarts the sweep from PK 0.
     let get_table_sql = "
         SELECT m.schema_name, m.table_name, m.pk_column,
                COALESCE(h.last_pk_checked, 0)::bigint AS last_pk
