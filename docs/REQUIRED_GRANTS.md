@@ -1,136 +1,69 @@
 # Required database privileges (grants)
 
-The database user used to connect to the **Publisher** and **Subscriber** for SyncGuard checks needs the following privileges.
+This repository is now centered on:
 
-This document covers both:
-
-- the original **Python validator / repair** flow
-- the newer **extension-backed bucket catalog** flow
-
-## Publisher
-
-SyncGuard only **reads** from the Publisher: it inspects catalog metadata and runs `SELECT` on the target table(s).
-
-- **Connect** to the database.
-- **Usage** on the schema(s) that contain the tables you validate.
-- **Select** on those tables.
-
-```sql
--- Replace syncguard_user, my_schema, my_table with your role and target objects.
--- Repeat GRANT USAGE / GRANT SELECT for each schema/table you will validate.
-
-GRANT CONNECT ON DATABASE your_database TO syncguard_user;
-
-GRANT USAGE ON SCHEMA my_schema TO syncguard_user;
-GRANT SELECT ON my_schema.my_table TO syncguard_user;
-```
-
-Schema analysis reads from `pg_catalog` (`pg_index`, `pg_attribute`, `pg_class`, `pg_namespace`). Those are readable by any role that can connect; no extra grants are required.
-
-## Subscriber
-
-On the Subscriber, SyncGuard **reads** (same hash/segment queries as on the Publisher) and **writes** when repairing (upsert).
-
-- **Connect** to the database.
-- **Usage** on the schema(s) that contain the replicated tables.
-- **Select** on those tables (for validation).
-- **Insert** and **Update** on those tables (for `INSERT ... ON CONFLICT DO UPDATE` during repair).
-
-```sql
-GRANT CONNECT ON DATABASE your_database TO syncguard_user;
-
-GRANT USAGE ON SCHEMA my_schema TO syncguard_user;
-GRANT SELECT, INSERT, UPDATE ON my_schema.my_table TO syncguard_user;
-```
-
-If you only run **validation** (no repair), `SELECT` (and `USAGE`) on the Subscriber is enough; `INSERT` and `UPDATE` are only needed when using `validate_and_repair`.
-
-## Example: one role for both servers
-
-If the same role exists on both Publisher and Subscriber (e.g. same user for both connections):
-
-```sql
--- On PUBLISHER (read-only for SyncGuard)
-GRANT USAGE ON SCHEMA public TO syncguard_user;
-GRANT SELECT ON public.replicated_table_1 TO syncguard_user;
-GRANT SELECT ON public.replicated_table_2 TO syncguard_user;
-
--- On SUBSCRIBER (read + write for repair)
-GRANT USAGE ON SCHEMA public TO syncguard_user;
-GRANT SELECT, INSERT, UPDATE ON public.replicated_table_1 TO syncguard_user;
-GRANT SELECT, INSERT, UPDATE ON public.replicated_table_2 TO syncguard_user;
-```
-
-## Control database (optional)
-
-When using the [Control Plane](CONTROL_PLANE.md) (syncguard schema), the role that connects to the **control database** needs:
-
-- **Connect** to the database.
-- **Usage** on schema `syncguard`.
-- **Insert**, **Select**, **Update** on `syncguard.validation_runs`.
-- **Insert**, **Select**, **Update** on `syncguard.divergence_log` (Update needed for dashboard "mark resolved"), plus **Usage, Select** on the sequence `syncguard.divergence_log_log_id_seq`.
-
-```sql
-GRANT CONNECT ON DATABASE your_control_database TO syncguard_user;
-GRANT USAGE ON SCHEMA syncguard TO syncguard_user;
-GRANT INSERT, SELECT, UPDATE ON syncguard.validation_runs TO syncguard_user;
-GRANT INSERT, SELECT, UPDATE ON syncguard.divergence_log TO syncguard_user;
-GRANT USAGE, SELECT ON SEQUENCE syncguard.divergence_log_log_id_seq TO syncguard_user;
-```
+- the `pg_sync_guard` PostgreSQL extension running on publisher and subscriber
+- an external CLI that reads extension state and compares both sides
+- an optional control-plane database for verification history
 
 ## Extension-side privileges
 
-When using the PostgreSQL extension (`pg_sync_guard`) on Publisher and Subscriber, think about privileges in two parts:
+Think about privileges in two roles:
 
 1. **runtime / comparison access** for the external CLI
-2. **registration / trigger setup** when calling `syncguard_register_table(...)`
+2. **registration / trigger management** for installing monitored-table hooks
 
-### Runtime / comparison access
+## Runtime / comparison role
 
-If the CLI only needs to read the stable bucket hashes from a database, the role needs:
+If a role only needs to read the extension state from a database, it should have:
 
-- **Connect** to the database
-- **Usage** on schema `syncguard`
-- **Select** on:
+- `CONNECT` on the database
+- `USAGE` on schema `syncguard`
+- `SELECT` on:
   - `syncguard.monitored_tables`
   - `syncguard.bucket_catalog`
-  - `syncguard.dirty_buckets` (optional; only if you want to inspect queue state)
-  - `syncguard.worker_state` (optional; only if you want to inspect backfill state)
+  - optionally `syncguard.dirty_buckets`
+  - optionally `syncguard.worker_state`
 
 Example:
 
 ```sql
-GRANT CONNECT ON DATABASE your_database TO syncguard_user;
-GRANT USAGE ON SCHEMA syncguard TO syncguard_user;
-GRANT SELECT ON syncguard.monitored_tables TO syncguard_user;
-GRANT SELECT ON syncguard.bucket_catalog TO syncguard_user;
-GRANT SELECT ON syncguard.dirty_buckets TO syncguard_user;
-GRANT SELECT ON syncguard.worker_state TO syncguard_user;
+GRANT CONNECT ON DATABASE your_database TO syncguard_reader;
+GRANT USAGE ON SCHEMA syncguard TO syncguard_reader;
+GRANT SELECT ON syncguard.monitored_tables TO syncguard_reader;
+GRANT SELECT ON syncguard.bucket_catalog TO syncguard_reader;
+GRANT SELECT ON syncguard.dirty_buckets TO syncguard_reader;
+GRANT SELECT ON syncguard.worker_state TO syncguard_reader;
 ```
 
 If the CLI should mark buckets as reviewed through `syncguard_mark_bucket_reviewed(...)`, also grant:
 
 ```sql
-GRANT UPDATE ON syncguard.bucket_catalog TO syncguard_user;
+GRANT UPDATE ON syncguard.bucket_catalog TO syncguard_reader;
 ```
 
-### Registering monitored tables
+## Registration / administration role
 
-Calling `syncguard_register_table(schema_name, table_name, pk_column, bucket_size)` does more than insert config:
+Calling `syncguard_register_table(schema_name, table_name, pk_column, bucket_size)` does all of the following:
 
-- writes to `syncguard.monitored_tables`
-- clears prior rows in `syncguard.bucket_catalog`, `syncguard.dirty_buckets`, and `syncguard.worker_state`
-- creates a trigger on the target application table
+- upserts config into `syncguard.monitored_tables`
+- clears old rows in `syncguard.bucket_catalog`
+- clears old rows in `syncguard.dirty_buckets`
+- resets `syncguard.worker_state`
+- creates / replaces the dirty-bucket trigger on the target table
+- enables that trigger as `ALWAYS`
 
-That means the role performing registration should be the **table owner** or another sufficiently privileged role. In practice, it needs:
+That means the role performing registration should be the **table owner** or another sufficiently privileged administrative role.
 
-- **Usage** on schema `syncguard`
-- **Insert / Update** on `syncguard.monitored_tables`
-- **Delete / Insert / Update / Select** on:
+It needs:
+
+- `USAGE` on schema `syncguard`
+- `INSERT`, `UPDATE` on `syncguard.monitored_tables`
+- `SELECT`, `INSERT`, `UPDATE`, `DELETE` on:
   - `syncguard.bucket_catalog`
   - `syncguard.dirty_buckets`
   - `syncguard.worker_state`
-- permission to **create triggers** on the target table(s)
+- permission to create and alter triggers on the target application table(s)
 
 Example:
 
@@ -141,19 +74,45 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON syncguard.bucket_catalog TO syncguard_ad
 GRANT SELECT, INSERT, UPDATE, DELETE ON syncguard.dirty_buckets TO syncguard_admin;
 GRANT SELECT, INSERT, UPDATE, DELETE ON syncguard.worker_state TO syncguard_admin;
 
--- Plus ownership / TRIGGER privilege on the target application table(s).
+-- Plus ownership or equivalent trigger-management rights on the target table(s).
 ```
 
-If you prefer a simpler operational model, use:
+## Target table access
 
-- one higher-privilege role to register tables and manage triggers
-- one lower-privilege read-only role for the CLI to read bucket hashes
+The extension hashes data inside the database, so the external CLI does **not** need direct `SELECT` on the application tables if it only reads the extension state.
 
-## Summary
+However, the registration/admin role needs enough rights on the target tables to install the trigger.
 
-| Server     | CONNECT | USAGE (schema) | SELECT (table) | INSERT (table) | UPDATE (table) |
-|-----------|---------|----------------|----------------|----------------|----------------|
-| Publisher | ✓       | ✓              | ✓              | —              | —              |
-| Subscriber (validate only) | ✓ | ✓              | ✓              | —              | —              |
-| Subscriber (validate + repair) | ✓ | ✓ | ✓              | ✓              | ✓              |
-| Control (syncguard) | ✓ | ✓ (syncguard) | ✓ | ✓ | ✓ (validation_runs only) |
+## Control plane (optional)
+
+If you use a separate control-plane database for verification-job history, the connecting role typically needs:
+
+- `CONNECT` on the control database
+- `USAGE` on schema `syncguard`
+- `INSERT`, `SELECT`, `UPDATE` on:
+  - `syncguard.validation_runs`
+  - `syncguard.divergence_log`
+- `USAGE`, `SELECT` on the `divergence_log` sequence if you use a `SERIAL` / sequence-backed key
+
+Example:
+
+```sql
+GRANT CONNECT ON DATABASE your_control_database TO syncguard_cli;
+GRANT USAGE ON SCHEMA syncguard TO syncguard_cli;
+GRANT INSERT, SELECT, UPDATE ON syncguard.validation_runs TO syncguard_cli;
+GRANT INSERT, SELECT, UPDATE ON syncguard.divergence_log TO syncguard_cli;
+GRANT USAGE, SELECT ON SEQUENCE syncguard.divergence_log_log_id_seq TO syncguard_cli;
+```
+
+## Recommended operational split
+
+A clean model is:
+
+- `syncguard_admin`
+  - installs the extension
+  - registers monitored tables
+  - manages triggers
+- `syncguard_reader` or `syncguard_cli`
+  - reads `bucket_catalog`
+  - optionally marks reviewed buckets
+  - writes verification history to the control plane

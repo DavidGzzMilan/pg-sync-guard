@@ -1,103 +1,82 @@
-# Control Plane (syncguard schema)
+# Control Plane (optional)
 
-SyncGuard can write run metadata and divergence details to a **central control database** using a **separate connection**. This keeps an audit trail of validations and repairs without touching the Publisher/Subscriber connections used for hashing.
+The `pg_sync_guard` extension keeps **current local hash state** inside each database.
 
-## Schema DDL
+An optional **control plane** is a separate database used by the external CLI to persist:
 
-Create the following in your control database (can be the same host as Publisher/Subscriber or a dedicated host):
+- verification job history
+- bucket-level divergence findings
+- review / remediation workflow state
+
+This keeps the extension lean while still allowing operational history and auditability.
+
+## Suggested schema
+
+Create this in a dedicated control database, or in another schema/database used for SyncGuard operations:
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS syncguard;
 
--- Tracks every time SyncGuard runs a check
 CREATE TABLE syncguard.validation_runs (
     run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    table_name TEXT NOT NULL,
-    status TEXT DEFAULT 'running',  -- running, success, diverged, failed
-    started_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    finished_at TIMESTAMP WITH TIME ZONE,
-    mismatch_count INT DEFAULT 0
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at TIMESTAMPTZ,
+    status TEXT NOT NULL DEFAULT 'running', -- running, success, diverged, failed
+    publisher_name TEXT NOT NULL,
+    subscriber_name TEXT NOT NULL,
+    table_filter TEXT,
+    total_buckets_compared BIGINT NOT NULL DEFAULT 0,
+    mismatched_buckets BIGINT NOT NULL DEFAULT 0,
+    notes TEXT
 );
 
--- Logs each diverged row and the applied fix
 CREATE TABLE syncguard.divergence_log (
-    log_id SERIAL PRIMARY KEY,
-    run_id UUID REFERENCES syncguard.validation_runs(run_id),
-    pk_value TEXT NOT NULL,
-    publisher_data JSONB,
-    subscriber_data JSONB,
-    repair_sql TEXT,
-    repaired_at TIMESTAMP WITH TIME ZONE,
-    resolved_at TIMESTAMP WITH TIME ZONE  -- set when user marks as resolved from dashboard (e.g. after re-running repair)
+    log_id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL REFERENCES syncguard.validation_runs(run_id),
+    schema_name TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    bucket_id BIGINT NOT NULL,
+    pk_start BIGINT NOT NULL,
+    pk_end BIGINT NOT NULL,
+    publisher_row_count BIGINT,
+    subscriber_row_count BIGINT,
+    publisher_hash TEXT,
+    subscriber_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'open', -- open, reviewed, resolved, ignored
+    review_notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewed_at TIMESTAMPTZ,
+    resolved_at TIMESTAMPTZ
 );
-
--- If you already have divergence_log without resolved_at:
--- ALTER TABLE syncguard.divergence_log ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE;
 ```
 
-## Required grants (control database)
+## How it fits the architecture
 
-The role used to connect to the control DB needs:
+The intended split is:
 
-```sql
-GRANT USAGE ON SCHEMA syncguard TO syncguard_user;
-GRANT INSERT, SELECT, UPDATE ON syncguard.validation_runs TO syncguard_user;
-GRANT INSERT, SELECT, UPDATE ON syncguard.divergence_log TO syncguard_user;
-GRANT USAGE, SELECT ON SEQUENCE syncguard.divergence_log_log_id_seq TO syncguard_user;
-```
+- extension:
+  - computes and stores current bucket state locally
+  - exposes `syncguard.bucket_catalog`, `syncguard.dirty_buckets`, and worker helpers
+- external CLI:
+  - connects to publisher and subscriber
+  - fetches bucket hashes from both sides
+  - compares them
+  - writes verification results into the control plane
 
-## Usage
+## Typical CLI flow
 
-Use a **separate connection** for the control database. Pass it as `control_conn` to `validate_and_repair` or `validate_only`; SyncGuard will:
+1. Insert a row into `syncguard.validation_runs` with `status = 'running'`
+2. Read bucket hashes from publisher and subscriber
+3. Compare buckets by `(schema_name, table_name, bucket_id)`
+4. Insert mismatches into `syncguard.divergence_log`
+5. Update the run with:
+   - `finished_at`
+   - `status`
+   - `total_buckets_compared`
+   - `mismatched_buckets`
 
-1. **At start**: insert a row into `validation_runs` with `status = 'running'`.
-2. **For each diverged row**: insert into `divergence_log` (pk_value, publisher_data, subscriber_data, repair_sql). If the run applies repairs, `repaired_at` is set; if you use **validate_only** (no repair in-process), `repaired_at` is NULL and repairs can be run later from the dashboard.
-3. **At end**: update the run with `status` ('success' or 'diverged'), `finished_at`, and `mismatch_count`.
+## Notes
 
-Example:
-
-```python
-import asyncio
-import asyncpg
-from sync_guard import SyncGuard, validate_and_repair, console_progress
-
-async def main():
-    pub = await asyncpg.connect(PUB_DSN)
-    sub = await asyncpg.connect(SUB_DSN)
-    control = await asyncpg.connect(CONTROL_DSN)  # separate connection
-
-    guard = SyncGuard(pub, sub)
-    repaired = await validate_and_repair(
-        guard, "public", "customers",
-        control_conn=control,
-        progress_callback=console_progress,
-    )
-
-    await pub.close()
-    await sub.close()
-    await control.close()
-
-asyncio.run(main())
-```
-
-- **control_conn**: connection to the database where the `syncguard` schema exists.
-- **progress_callback**: optional `(stage, detail)` callback for human-readable output; `console_progress` prints to stdout with a `[SyncGuard]` prefix.
-
-You can also pass a pre-built `ControlPlane` instance instead of `control_conn`:
-
-```python
-from sync_guard import ControlPlane
-
-control = await asyncpg.connect(CONTROL_DSN)
-cp = ControlPlane(control, schema="syncguard")
-repaired = await validate_and_repair(guard, "public", "customers", control_plane=cp)
-```
-
-## Run statuses
-
-| status   | Meaning |
-|----------|---------|
-| running  | Run started, not yet finished |
-| success  | Finished; no hash mismatches (or no repairs needed) |
-| diverged | Finished; one or more rows were repaired |
-| failed   | Run ended with an exception |
+- The control plane is intentionally separate from the extension state.
+- `bucket_catalog` on publisher/subscriber should represent **current state**, not history.
+- Historical reporting belongs in the control plane, not inside the extension tables.
