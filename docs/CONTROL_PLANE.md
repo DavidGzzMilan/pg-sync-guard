@@ -27,8 +27,12 @@ CREATE TABLE syncguard.divergence_log (
     publisher_data JSONB,
     subscriber_data JSONB,
     repair_sql TEXT,
-    repaired_at TIMESTAMP WITH TIME ZONE
+    repaired_at TIMESTAMP WITH TIME ZONE,
+    resolved_at TIMESTAMP WITH TIME ZONE  -- set when user marks as resolved from dashboard (e.g. after re-running repair)
 );
+
+-- If you already have divergence_log without resolved_at:
+-- ALTER TABLE syncguard.divergence_log ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE;
 ```
 
 ## Required grants (control database)
@@ -38,16 +42,16 @@ The role used to connect to the control DB needs:
 ```sql
 GRANT USAGE ON SCHEMA syncguard TO syncguard_user;
 GRANT INSERT, SELECT, UPDATE ON syncguard.validation_runs TO syncguard_user;
-GRANT INSERT, SELECT ON syncguard.divergence_log TO syncguard_user;
+GRANT INSERT, SELECT, UPDATE ON syncguard.divergence_log TO syncguard_user;
 GRANT USAGE, SELECT ON SEQUENCE syncguard.divergence_log_log_id_seq TO syncguard_user;
 ```
 
 ## Usage
 
-Use a **separate connection** for the control database. Pass it as `control_conn` to `validate_and_repair`; SyncGuard will:
+Use a **separate connection** for the control database. Pass it as `control_conn` to `validate_and_repair` or `validate_only`; SyncGuard will:
 
 1. **At start**: insert a row into `validation_runs` with `status = 'running'`.
-2. **For each repaired row**: insert into `divergence_log` (pk_value, publisher_data, subscriber_data, repair_sql, repaired_at).
+2. **For each diverged row**: insert into `divergence_log` (pk_value, publisher_data, subscriber_data, repair_sql). If the run applies repairs, `repaired_at` is set; if you use **validate_only** (no repair in-process), `repaired_at` is NULL and repairs can be run later from the dashboard.
 3. **At end**: update the run with `status` ('success' or 'diverged'), `finished_at`, and `mismatch_count`.
 
 Example:

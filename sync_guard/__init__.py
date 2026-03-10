@@ -11,14 +11,14 @@ from sync_guard.exceptions import (
     ValidationError,
 )
 from sync_guard.schema import TableInfo
-from sync_guard.validator import SyncGuard, validate_and_repair, console_progress
+from sync_guard.validator import SyncGuard, validate_and_repair, validate_only, console_progress
 
 __all__ = [
     "ControlPlane",
     "SyncGuard",
     "console_progress",
     "validate_and_repair",
-    "validate_and_repair",
+    "validate_only",
     "TableInfo",
     "SyncGuardError",
     "SchemaError",
