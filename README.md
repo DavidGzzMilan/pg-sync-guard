@@ -5,7 +5,7 @@
 The repository currently centers on:
 
 - `pg_sync_guard/`: a PostgreSQL extension that computes and persists **stable per-bucket hashes** inside each database
-- an upcoming **external CLI**: planned to connect to publisher and subscriber, compare bucket hashes, report divergences, and optionally persist verification history in a control plane
+- `cmd/syncguard-cli/`: the first Go CLI foundation for comparing publisher and subscriber bucket catalogs
 
 The old Python prototype and dashboard have been removed so the repository matches the current product direction.
 
@@ -15,7 +15,7 @@ Install `pg_sync_guard` on **both** publisher and subscriber:
 
 - each side computes local bucket hashes
 - the extension tracks dirty buckets and recomputes only the buckets affected by changes in the normal case
-- an external CLI compares `syncguard.bucket_catalog` across both sides
+- the Go CLI compares `syncguard.bucket_catalog` across both sides
 - an optional control plane database can store verification-job history and divergence records
 
 ## Repository layout
@@ -24,6 +24,11 @@ Install `pg_sync_guard` on **both** publisher and subscriber:
   - pgrx extension crate
   - dynamic per-database background worker
   - bucket catalog, dirty bucket queue, worker state, and helper SQL functions
+- `cmd/syncguard-cli/`
+  - Go CLI entrypoint
+  - currently includes MVP `verify` command scaffolding
+- `internal/`
+  - shared Go packages for config, DB access, extension reads, comparison, reporting, and control-plane writes
 - `docs/PG_EXTENSION.md`
   - extension usage, worker model, and example queries
 - `docs/CONTROL_PLANE.md`
@@ -76,15 +81,44 @@ FROM syncguard.bucket_catalog
 ORDER BY schema_name, table_name, bucket_id;
 ```
 
+### 6. Run the CLI verify command
+
+With Go available locally:
+
+```bash
+go run ./cmd/syncguard-cli verify \
+  --publisher-dsn "$SYNCGUARD_PUBLISHER_DSN" \
+  --subscriber-dsn "$SYNCGUARD_SUBSCRIBER_DSN"
+```
+
+Optional flags:
+
+- `--schema public`
+- `--table my_table`
+- `--json`
+- `--control-dsn "$SYNCGUARD_CONTROL_DSN" --write-control-plane`
+
 ## Documentation
 
 - extension guide: `docs/PG_EXTENSION.md`
 - control plane: `docs/CONTROL_PLANE.md`
 - grants: `docs/REQUIRED_GRANTS.md`
 
+## Current CLI scope
+
+The current Go CLI foundation includes:
+
+- config loading from flags and environment variables
+- PostgreSQL connectivity using `pgx`
+- reads from `syncguard.bucket_catalog`
+- publisher/subscriber bucket comparison
+- text or JSON output
+- optional control-plane inserts for `validation_runs` and `divergence_log`
+
+The next CLI steps are drill-down, remediation planning, and packaging.
+
 ## Near-term roadmap
 
-- add the production CLI in Go
-- compare bucket catalogs across publisher and subscriber
-- persist verification runs and divergences in the optional control plane
+- add drill-down logic below mismatched buckets
+- plan and execute remediation workflows from the CLI
 - package the CLI for `.rpm` / `.deb` delivery
