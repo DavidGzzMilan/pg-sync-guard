@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/compare"
+	"github.com/DavidGzzMilan/pg-sync-guard/internal/repairplan"
 )
 
 func WriteText(w io.Writer, publisherName, subscriberName string, summary compare.Summary) error {
@@ -105,6 +106,45 @@ func WriteInspectJSON(w io.Writer, publisherName, subscriberName string, summary
 		Publisher  string                 `json:"publisher"`
 		Subscriber string                 `json:"subscriber"`
 		Summary    compare.InspectSummary `json:"summary"`
+	}{
+		Publisher:  publisherName,
+		Subscriber: subscriberName,
+		Summary:    summary,
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(payload)
+}
+
+func WriteRepairText(w io.Writer, publisherName, subscriberName string, summary repairplan.ApplySummary) error {
+	if _, err := fmt.Fprintf(
+		w,
+		"Applied %d/%d repair statement(s) to %s for %s.%s bucket=%d using %s as source.\n",
+		summary.StatementsApplied,
+		summary.StatementsPlanned,
+		subscriberName,
+		summary.SchemaName,
+		summary.TableName,
+		summary.BucketID,
+		publisherName,
+	); err != nil {
+		return err
+	}
+
+	if summary.StatementsPlanned == 0 {
+		_, err := fmt.Fprintln(w, "No repair actions were needed.")
+		return err
+	}
+
+	return nil
+}
+
+func WriteRepairJSON(w io.Writer, publisherName, subscriberName string, summary repairplan.ApplySummary) error {
+	payload := struct {
+		Publisher  string                  `json:"publisher"`
+		Subscriber string                  `json:"subscriber"`
+		Summary    repairplan.ApplySummary `json:"summary"`
 	}{
 		Publisher:  publisherName,
 		Subscriber: subscriberName,

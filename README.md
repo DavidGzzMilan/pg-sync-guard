@@ -120,6 +120,23 @@ For each row-level divergence, `inspect` now also generates a suggested repair S
 - `INSERT ... ON CONFLICT DO UPDATE` when the publisher row should be copied to the subscriber
 - `DELETE` when the subscriber has an extra row that is missing on the publisher
 
+### 8. Explicitly apply planned repairs
+
+When you want to execute the suggested repair SQL against the subscriber, use `repair`:
+
+```bash
+go run ./cmd/syncguard-cli repair \
+  --publisher-dsn "$SYNCGUARD_PUBLISHER_DSN" \
+  --subscriber-dsn "$SYNCGUARD_SUBSCRIBER_DSN" \
+  --schema public \
+  --table my_table \
+  --bucket-id 42
+```
+
+`repair` re-runs the bucket inspection, rebuilds the repair plan, and applies the statements to the subscriber in a single transaction. It never runs implicitly as part of `verify` or `inspect`.
+
+Note: because subscriber-side repairs fire SyncGuard's dirty-bucket trigger, the CLI role currently also needs the corresponding write privileges on the subscriber's `syncguard` internal tables. See `docs/REQUIRED_GRANTS.md`.
+
 ## Documentation
 
 - extension guide: `docs/PG_EXTENSION.md`
@@ -137,6 +154,7 @@ The current Go CLI foundation includes:
 - publisher/subscriber bucket comparison
 - bucket-level row drill-down with `inspect`
 - suggested subscriber repair SQL from row-level diffs
+- explicit subscriber-side apply flow with `repair`
 - text or JSON output
 - optional control-plane inserts for `validation_runs` and `divergence_log`
 

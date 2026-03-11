@@ -27,6 +27,15 @@ type InspectConfig struct {
 	JSON          bool
 }
 
+type RepairConfig struct {
+	PublisherDSN  string
+	SubscriberDSN string
+	Schema        string
+	Table         string
+	BucketID      int64
+	JSON          bool
+}
+
 func NewVerifyCommand() (*flag.FlagSet, *VerifyConfig) {
 	cfg := &VerifyConfig{}
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
@@ -70,6 +79,39 @@ func NewInspectCommand() (*flag.FlagSet, *InspectConfig) {
 }
 
 func (c *InspectConfig) Validate() error {
+	if strings.TrimSpace(c.PublisherDSN) == "" {
+		return errors.New("publisher DSN is required")
+	}
+	if strings.TrimSpace(c.SubscriberDSN) == "" {
+		return errors.New("subscriber DSN is required")
+	}
+	if strings.TrimSpace(c.Schema) == "" {
+		return errors.New("schema is required")
+	}
+	if strings.TrimSpace(c.Table) == "" {
+		return errors.New("table is required")
+	}
+	if c.BucketID < 0 {
+		return errors.New("bucket-id must be zero or greater")
+	}
+	return nil
+}
+
+func NewRepairCommand() (*flag.FlagSet, *RepairConfig) {
+	cfg := &RepairConfig{}
+	fs := flag.NewFlagSet("repair", flag.ContinueOnError)
+
+	fs.StringVar(&cfg.PublisherDSN, "publisher-dsn", getenv("SYNCGUARD_PUBLISHER_DSN", ""), "PostgreSQL DSN for the publisher")
+	fs.StringVar(&cfg.SubscriberDSN, "subscriber-dsn", getenv("SYNCGUARD_SUBSCRIBER_DSN", ""), "PostgreSQL DSN for the subscriber")
+	fs.StringVar(&cfg.Schema, "schema", getenv("SYNCGUARD_SCHEMA", ""), "Schema name for the monitored table")
+	fs.StringVar(&cfg.Table, "table", getenv("SYNCGUARD_TABLE", ""), "Table name for the monitored table")
+	fs.Int64Var(&cfg.BucketID, "bucket-id", 0, "Bucket identifier to repair")
+	fs.BoolVar(&cfg.JSON, "json", getenvBool("SYNCGUARD_JSON", false), "Emit JSON instead of text output")
+
+	return fs, cfg
+}
+
+func (c *RepairConfig) Validate() error {
 	if strings.TrimSpace(c.PublisherDSN) == "" {
 		return errors.New("publisher DSN is required")
 	}

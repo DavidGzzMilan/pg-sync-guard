@@ -16,6 +16,7 @@ import (
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/extension"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/repairplan"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/report"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -35,6 +36,8 @@ func run(args []string) error {
 		return runVerify(args[1:])
 	case "inspect":
 		return runInspect(args[1:])
+	case "repair":
+		return runRepair(args[1:])
 	case "-h", "--help", "help":
 		printUsage(os.Stdout)
 		return nil
@@ -133,65 +136,20 @@ func runInspect(args []string) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop, cancel := commandContext()
 	defer stop()
-
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	pubPool, err := db.Connect(ctx, cfg.PublisherDSN)
+	pubPool, subPool, err := connectPair(ctx, cfg.PublisherDSN, cfg.SubscriberDSN)
 	if err != nil {
-		return fmt.Errorf("connect publisher: %w", err)
+		return err
 	}
 	defer pubPool.Close()
-
-	subPool, err := db.Connect(ctx, cfg.SubscriberDSN)
-	if err != nil {
-		return fmt.Errorf("connect subscriber: %w", err)
-	}
 	defer subPool.Close()
 
-	pubMeta, err := extension.FetchMonitoredTable(ctx, pubPool, cfg.Schema, cfg.Table)
+	publisherName, subscriberName, summary, err := inspectAndPlan(ctx, pubPool, subPool, cfg.Schema, cfg.Table, cfg.BucketID)
 	if err != nil {
-		return fmt.Errorf("fetch publisher monitored table metadata: %w", err)
-	}
-	subMeta, err := extension.FetchMonitoredTable(ctx, subPool, cfg.Schema, cfg.Table)
-	if err != nil {
-		return fmt.Errorf("fetch subscriber monitored table metadata: %w", err)
-	}
-	if pubMeta.PKColumn != subMeta.PKColumn {
-		return fmt.Errorf("pk column mismatch between publisher (%s) and subscriber (%s)", pubMeta.PKColumn, subMeta.PKColumn)
-	}
-	if pubMeta.BucketSize != subMeta.BucketSize {
-		return fmt.Errorf("bucket size mismatch between publisher (%d) and subscriber (%d)", pubMeta.BucketSize, subMeta.BucketSize)
-	}
-
-	publisherRows, pkStart, pkEnd, err := extension.FetchBucketRows(ctx, pubPool, pubMeta, cfg.BucketID)
-	if err != nil {
-		return fmt.Errorf("fetch publisher bucket rows: %w", err)
-	}
-	subscriberRows, _, _, err := extension.FetchBucketRows(ctx, subPool, subMeta, cfg.BucketID)
-	if err != nil {
-		return fmt.Errorf("fetch subscriber bucket rows: %w", err)
-	}
-
-	publisherName, err := extension.CurrentDatabaseName(ctx, pubPool)
-	if err != nil {
-		return fmt.Errorf("fetch publisher database name: %w", err)
-	}
-	subscriberName, err := extension.CurrentDatabaseName(ctx, subPool)
-	if err != nil {
-		return fmt.Errorf("fetch subscriber database name: %w", err)
-	}
-
-	columns, err := extension.FetchTableColumns(ctx, pubPool, cfg.Schema, cfg.Table)
-	if err != nil {
-		return fmt.Errorf("fetch publisher table columns: %w", err)
-	}
-
-	summary := compare.InspectBucket(pubMeta, cfg.BucketID, pkStart, pkEnd, publisherRows, subscriberRows)
-	if err := repairplan.ApplyInspectPlans(&summary, pubMeta, columns); err != nil {
-		return fmt.Errorf("build repair plan: %w", err)
+		return err
 	}
 
 	if cfg.JSON {
@@ -210,17 +168,134 @@ func runInspect(args []string) error {
 	return nil
 }
 
+func runRepair(args []string) error {
+	fs, cfg := config.NewRepairCommand()
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	ctx, stop, cancel := commandContext()
+	defer stop()
+	defer cancel()
+
+	pubPool, subPool, err := connectPair(ctx, cfg.PublisherDSN, cfg.SubscriberDSN)
+	if err != nil {
+		return err
+	}
+	defer pubPool.Close()
+	defer subPool.Close()
+
+	publisherName, subscriberName, inspectSummary, err := inspectAndPlan(ctx, pubPool, subPool, cfg.Schema, cfg.Table, cfg.BucketID)
+	if err != nil {
+		return err
+	}
+
+	applySummary, err := repairplan.ExecuteInspectPlans(ctx, subPool, inspectSummary)
+	if err != nil {
+		return fmt.Errorf("apply repair plan: %w", err)
+	}
+
+	if cfg.JSON {
+		if err := report.WriteRepairJSON(os.Stdout, publisherName, subscriberName, applySummary); err != nil {
+			return fmt.Errorf("write JSON repair report: %w", err)
+		}
+	} else {
+		if err := report.WriteRepairText(os.Stdout, publisherName, subscriberName, applySummary); err != nil {
+			return fmt.Errorf("write text repair report: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func commandContext() (context.Context, context.CancelFunc, context.CancelFunc) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	return ctx, stop, cancel
+}
+
+func connectPair(ctx context.Context, publisherDSN, subscriberDSN string) (*pgxpool.Pool, *pgxpool.Pool, error) {
+	pubPool, err := db.Connect(ctx, publisherDSN)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect publisher: %w", err)
+	}
+	subPool, err := db.Connect(ctx, subscriberDSN)
+	if err != nil {
+		pubPool.Close()
+		return nil, nil, fmt.Errorf("connect subscriber: %w", err)
+	}
+	return pubPool, subPool, nil
+}
+
+func inspectAndPlan(
+	ctx context.Context,
+	pubPool *pgxpool.Pool,
+	subPool *pgxpool.Pool,
+	schema string,
+	table string,
+	bucketID int64,
+) (string, string, compare.InspectSummary, error) {
+	pubMeta, err := extension.FetchMonitoredTable(ctx, pubPool, schema, table)
+	if err != nil {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("fetch publisher monitored table metadata: %w", err)
+	}
+	subMeta, err := extension.FetchMonitoredTable(ctx, subPool, schema, table)
+	if err != nil {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("fetch subscriber monitored table metadata: %w", err)
+	}
+	if pubMeta.PKColumn != subMeta.PKColumn {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("pk column mismatch between publisher (%s) and subscriber (%s)", pubMeta.PKColumn, subMeta.PKColumn)
+	}
+	if pubMeta.BucketSize != subMeta.BucketSize {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("bucket size mismatch between publisher (%d) and subscriber (%d)", pubMeta.BucketSize, subMeta.BucketSize)
+	}
+
+	publisherRows, pkStart, pkEnd, err := extension.FetchBucketRows(ctx, pubPool, pubMeta, bucketID)
+	if err != nil {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("fetch publisher bucket rows: %w", err)
+	}
+	subscriberRows, _, _, err := extension.FetchBucketRows(ctx, subPool, subMeta, bucketID)
+	if err != nil {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("fetch subscriber bucket rows: %w", err)
+	}
+
+	publisherName, err := extension.CurrentDatabaseName(ctx, pubPool)
+	if err != nil {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("fetch publisher database name: %w", err)
+	}
+	subscriberName, err := extension.CurrentDatabaseName(ctx, subPool)
+	if err != nil {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("fetch subscriber database name: %w", err)
+	}
+
+	columns, err := extension.FetchTableColumns(ctx, pubPool, schema, table)
+	if err != nil {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("fetch publisher table columns: %w", err)
+	}
+
+	summary := compare.InspectBucket(pubMeta, bucketID, pkStart, pkEnd, publisherRows, subscriberRows)
+	if err := repairplan.ApplyInspectPlans(&summary, pubMeta, columns); err != nil {
+		return "", "", compare.InspectSummary{}, fmt.Errorf("build repair plan: %w", err)
+	}
+
+	return publisherName, subscriberName, summary, nil
+}
+
 func usageError() error {
 	return errors.New(usageText())
 }
 
 func usageText() string {
 	return `Usage:
-  syncguard-cli verify [flags]
+  syncguard-cli <command> [flags]
 
 Commands:
   verify    compare syncguard.bucket_catalog across publisher and subscriber
   inspect   compare full rows inside one bucket range
+  repair    apply planned repair SQL to the subscriber for one bucket
 
 Flags for verify:
   --publisher-dsn         PostgreSQL DSN for publisher
@@ -237,6 +312,14 @@ Flags for inspect:
   --schema                Schema name for the monitored table
   --table                 Table name for the monitored table
   --bucket-id             Bucket identifier to inspect
+  --json                  Emit JSON output
+
+Flags for repair:
+  --publisher-dsn         PostgreSQL DSN for publisher
+  --subscriber-dsn        PostgreSQL DSN for subscriber
+  --schema                Schema name for the monitored table
+  --table                 Table name for the monitored table
+  --bucket-id             Bucket identifier to repair
   --json                  Emit JSON output
 
 Environment variables:
