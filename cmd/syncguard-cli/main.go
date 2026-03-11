@@ -14,6 +14,7 @@ import (
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/controlplane"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/db"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/extension"
+	"github.com/DavidGzzMilan/pg-sync-guard/internal/repairplan"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/report"
 )
 
@@ -32,6 +33,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "verify":
 		return runVerify(args[1:])
+	case "inspect":
+		return runInspect(args[1:])
 	case "-h", "--help", "help":
 		printUsage(os.Stdout)
 		return nil
@@ -121,6 +124,92 @@ func runVerify(args []string) error {
 	return nil
 }
 
+func runInspect(args []string) error {
+	fs, cfg := config.NewInspectCommand()
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	pubPool, err := db.Connect(ctx, cfg.PublisherDSN)
+	if err != nil {
+		return fmt.Errorf("connect publisher: %w", err)
+	}
+	defer pubPool.Close()
+
+	subPool, err := db.Connect(ctx, cfg.SubscriberDSN)
+	if err != nil {
+		return fmt.Errorf("connect subscriber: %w", err)
+	}
+	defer subPool.Close()
+
+	pubMeta, err := extension.FetchMonitoredTable(ctx, pubPool, cfg.Schema, cfg.Table)
+	if err != nil {
+		return fmt.Errorf("fetch publisher monitored table metadata: %w", err)
+	}
+	subMeta, err := extension.FetchMonitoredTable(ctx, subPool, cfg.Schema, cfg.Table)
+	if err != nil {
+		return fmt.Errorf("fetch subscriber monitored table metadata: %w", err)
+	}
+	if pubMeta.PKColumn != subMeta.PKColumn {
+		return fmt.Errorf("pk column mismatch between publisher (%s) and subscriber (%s)", pubMeta.PKColumn, subMeta.PKColumn)
+	}
+	if pubMeta.BucketSize != subMeta.BucketSize {
+		return fmt.Errorf("bucket size mismatch between publisher (%d) and subscriber (%d)", pubMeta.BucketSize, subMeta.BucketSize)
+	}
+
+	publisherRows, pkStart, pkEnd, err := extension.FetchBucketRows(ctx, pubPool, pubMeta, cfg.BucketID)
+	if err != nil {
+		return fmt.Errorf("fetch publisher bucket rows: %w", err)
+	}
+	subscriberRows, _, _, err := extension.FetchBucketRows(ctx, subPool, subMeta, cfg.BucketID)
+	if err != nil {
+		return fmt.Errorf("fetch subscriber bucket rows: %w", err)
+	}
+
+	publisherName, err := extension.CurrentDatabaseName(ctx, pubPool)
+	if err != nil {
+		return fmt.Errorf("fetch publisher database name: %w", err)
+	}
+	subscriberName, err := extension.CurrentDatabaseName(ctx, subPool)
+	if err != nil {
+		return fmt.Errorf("fetch subscriber database name: %w", err)
+	}
+
+	columns, err := extension.FetchTableColumns(ctx, pubPool, cfg.Schema, cfg.Table)
+	if err != nil {
+		return fmt.Errorf("fetch publisher table columns: %w", err)
+	}
+
+	summary := compare.InspectBucket(pubMeta, cfg.BucketID, pkStart, pkEnd, publisherRows, subscriberRows)
+	if err := repairplan.ApplyInspectPlans(&summary, pubMeta, columns); err != nil {
+		return fmt.Errorf("build repair plan: %w", err)
+	}
+
+	if cfg.JSON {
+		if err := report.WriteInspectJSON(os.Stdout, publisherName, subscriberName, summary); err != nil {
+			return fmt.Errorf("write JSON inspect report: %w", err)
+		}
+	} else {
+		if err := report.WriteInspectText(os.Stdout, publisherName, subscriberName, summary); err != nil {
+			return fmt.Errorf("write text inspect report: %w", err)
+		}
+	}
+
+	if summary.MismatchedRows > 0 {
+		return errors.New("row mismatches found in bucket")
+	}
+	return nil
+}
+
 func usageError() error {
 	return errors.New(usageText())
 }
@@ -131,6 +220,7 @@ func usageText() string {
 
 Commands:
   verify    compare syncguard.bucket_catalog across publisher and subscriber
+  inspect   compare full rows inside one bucket range
 
 Flags for verify:
   --publisher-dsn         PostgreSQL DSN for publisher
@@ -140,6 +230,14 @@ Flags for verify:
   --table                 Optional table filter
   --json                  Emit JSON output
   --write-control-plane   Persist run results to control plane
+
+Flags for inspect:
+  --publisher-dsn         PostgreSQL DSN for publisher
+  --subscriber-dsn        PostgreSQL DSN for subscriber
+  --schema                Schema name for the monitored table
+  --table                 Table name for the monitored table
+  --bucket-id             Bucket identifier to inspect
+  --json                  Emit JSON output
 
 Environment variables:
   SYNCGUARD_PUBLISHER_DSN

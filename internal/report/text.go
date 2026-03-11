@@ -48,13 +48,67 @@ func WriteText(w io.Writer, publisherName, subscriberName string, summary compar
 
 func WriteJSON(w io.Writer, publisherName, subscriberName string, summary compare.Summary) error {
 	payload := struct {
-		Publisher string          `json:"publisher"`
-		Subscriber string         `json:"subscriber"`
-		Summary   compare.Summary `json:"summary"`
+		Publisher  string          `json:"publisher"`
+		Subscriber string          `json:"subscriber"`
+		Summary    compare.Summary `json:"summary"`
 	}{
-		Publisher: publisherName,
+		Publisher:  publisherName,
 		Subscriber: subscriberName,
-		Summary:   summary,
+		Summary:    summary,
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(payload)
+}
+
+func WriteInspectText(w io.Writer, publisherName, subscriberName string, summary compare.InspectSummary) error {
+	if _, err := fmt.Fprintf(
+		w,
+		"Inspected %s.%s bucket=%d pk_column=%s range=[%d,%d) between %s and %s.\n",
+		summary.SchemaName,
+		summary.TableName,
+		summary.BucketID,
+		summary.PKColumn,
+		summary.PKStart,
+		summary.PKEnd,
+		publisherName,
+		subscriberName,
+	); err != nil {
+		return err
+	}
+
+	if summary.MismatchedRows == 0 {
+		_, err := fmt.Fprintln(w, "No mismatched rows found in this bucket.")
+		return err
+	}
+
+	if _, err := fmt.Fprintf(w, "Found %d mismatched row(s):\n", summary.MismatchedRows); err != nil {
+		return err
+	}
+	for _, diff := range summary.Diffs {
+		if _, err := fmt.Fprintf(w, "- pk=%s status=%s\n", diff.PKValue, diff.Status); err != nil {
+			return err
+		}
+		if diff.RepairSQL != "" {
+			if _, err := fmt.Fprintf(w, "  repair_sql: %s\n", diff.RepairSQL); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func WriteInspectJSON(w io.Writer, publisherName, subscriberName string, summary compare.InspectSummary) error {
+	payload := struct {
+		Publisher  string                 `json:"publisher"`
+		Subscriber string                 `json:"subscriber"`
+		Summary    compare.InspectSummary `json:"summary"`
+	}{
+		Publisher:  publisherName,
+		Subscriber: subscriberName,
+		Summary:    summary,
 	}
 
 	enc := json.NewEncoder(w)

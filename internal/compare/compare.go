@@ -1,6 +1,8 @@
 package compare
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 
@@ -30,6 +32,27 @@ type Summary struct {
 	TotalBuckets      int          `json:"total_buckets"`
 	MismatchedBuckets int          `json:"mismatched_buckets"`
 	Diffs             []BucketDiff `json:"diffs"`
+}
+
+type RowDiff struct {
+	PKValue        string          `json:"pk_value"`
+	PublisherData  json.RawMessage `json:"publisher_data,omitempty"`
+	SubscriberData json.RawMessage `json:"subscriber_data,omitempty"`
+	Status         string          `json:"status"`
+	RepairSQL      string          `json:"repair_sql,omitempty"`
+}
+
+type InspectSummary struct {
+	SchemaName         string    `json:"schema_name"`
+	TableName          string    `json:"table_name"`
+	PKColumn           string    `json:"pk_column"`
+	BucketID           int64     `json:"bucket_id"`
+	PKStart            int64     `json:"pk_start"`
+	PKEnd              int64     `json:"pk_end"`
+	PublisherRowCount  int       `json:"publisher_row_count"`
+	SubscriberRowCount int       `json:"subscriber_row_count"`
+	MismatchedRows     int       `json:"mismatched_rows"`
+	Diffs              []RowDiff `json:"diffs"`
 }
 
 func CompareBuckets(publisher, subscriber []extension.BucketHash) Summary {
@@ -81,14 +104,14 @@ func CompareBuckets(publisher, subscriber []extension.BucketHash) Summary {
 			})
 		case !pubOK && subOK:
 			summary.Diffs = append(summary.Diffs, BucketDiff{
-				SchemaName:       key.SchemaName,
-				TableName:        key.TableName,
-				BucketID:         key.BucketID,
-				PKStart:          &sub.PKStart,
-				PKEnd:            &sub.PKEnd,
-				SubscriberHash:   sub.BucketHash,
-				SubscriberCount:  &sub.RowCount,
-				Status:           "missing_on_publisher",
+				SchemaName:      key.SchemaName,
+				TableName:       key.TableName,
+				BucketID:        key.BucketID,
+				PKStart:         &sub.PKStart,
+				PKEnd:           &sub.PKEnd,
+				SubscriberHash:  sub.BucketHash,
+				SubscriberCount: &sub.RowCount,
+				Status:          "missing_on_publisher",
 			})
 		default:
 			status := classify(pub, sub)
@@ -146,4 +169,82 @@ func deref(value *string) string {
 
 func (d BucketDiff) String() string {
 	return fmt.Sprintf("%s.%s bucket=%d status=%s", d.SchemaName, d.TableName, d.BucketID, d.Status)
+}
+
+func InspectBucket(
+	meta extension.MonitoredTable,
+	bucketID int64,
+	pkStart int64,
+	pkEnd int64,
+	publisherRows []extension.BucketRow,
+	subscriberRows []extension.BucketRow,
+) InspectSummary {
+	pubByPK := make(map[string]extension.BucketRow, len(publisherRows))
+	subByPK := make(map[string]extension.BucketRow, len(subscriberRows))
+	allPKs := make(map[string]struct{}, len(publisherRows)+len(subscriberRows))
+
+	for _, row := range publisherRows {
+		pubByPK[row.PKValue] = row
+		allPKs[row.PKValue] = struct{}{}
+	}
+	for _, row := range subscriberRows {
+		subByPK[row.PKValue] = row
+		allPKs[row.PKValue] = struct{}{}
+	}
+
+	pks := make([]string, 0, len(allPKs))
+	for pk := range allPKs {
+		pks = append(pks, pk)
+	}
+	sort.Strings(pks)
+
+	summary := InspectSummary{
+		SchemaName:         meta.SchemaName,
+		TableName:          meta.TableName,
+		PKColumn:           meta.PKColumn,
+		BucketID:           bucketID,
+		PKStart:            pkStart,
+		PKEnd:              pkEnd,
+		PublisherRowCount:  len(publisherRows),
+		SubscriberRowCount: len(subscriberRows),
+	}
+
+	for _, pk := range pks {
+		pub, pubOK := pubByPK[pk]
+		sub, subOK := subByPK[pk]
+
+		switch {
+		case pubOK && !subOK:
+			summary.Diffs = append(summary.Diffs, RowDiff{
+				PKValue:       pk,
+				PublisherData: cloneBytes(pub.RowData),
+				Status:        "missing_on_subscriber",
+			})
+		case !pubOK && subOK:
+			summary.Diffs = append(summary.Diffs, RowDiff{
+				PKValue:        pk,
+				SubscriberData: cloneBytes(sub.RowData),
+				Status:         "missing_on_publisher",
+			})
+		case !bytes.Equal(pub.RowData, sub.RowData):
+			summary.Diffs = append(summary.Diffs, RowDiff{
+				PKValue:        pk,
+				PublisherData:  cloneBytes(pub.RowData),
+				SubscriberData: cloneBytes(sub.RowData),
+				Status:         "row_mismatch",
+			})
+		}
+	}
+
+	summary.MismatchedRows = len(summary.Diffs)
+	return summary
+}
+
+func cloneBytes(value []byte) json.RawMessage {
+	if value == nil {
+		return nil
+	}
+	out := make([]byte, len(value))
+	copy(out, value)
+	return json.RawMessage(out)
 }

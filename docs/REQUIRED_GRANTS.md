@@ -42,6 +42,28 @@ If the CLI should mark buckets as reviewed through `syncguard_mark_bucket_review
 GRANT UPDATE ON syncguard.bucket_catalog TO syncguard_reader;
 ```
 
+If the CLI should also use `inspect` to drill into a mismatched bucket, that same role additionally needs direct `SELECT` on the target application table(s), because `inspect` reads the full rows inside the bucket range.
+
+Example for one monitored table:
+
+```sql
+GRANT SELECT ON TABLE public.sg_demo TO syncguard_reader;
+```
+
+If you want a schema-wide grant for inspection workflows:
+
+```sql
+GRANT USAGE ON SCHEMA public TO syncguard_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO syncguard_reader;
+```
+
+And if future tables in that schema should also be inspectable:
+
+```sql
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+GRANT SELECT ON TABLES TO syncguard_reader;
+```
+
 ## Registration / administration role
 
 Calling `syncguard_register_table(schema_name, table_name, pk_column, bucket_size)` does all of the following:
@@ -81,7 +103,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON syncguard.worker_state TO syncguard_admi
 
 The extension hashes data inside the database, so the external CLI does **not** need direct `SELECT` on the application tables if it only reads the extension state.
 
-However, the registration/admin role needs enough rights on the target tables to install the trigger.
+However:
+
+- the registration/admin role needs enough rights on the target tables to install the trigger
+- the CLI role needs direct `SELECT` on the target tables if it will use `inspect` for row-level drill-down
 
 ## Control plane (optional)
 

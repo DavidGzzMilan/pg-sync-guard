@@ -98,6 +98,28 @@ Optional flags:
 - `--json`
 - `--control-dsn "$SYNCGUARD_CONTROL_DSN" --write-control-plane`
 
+### 7. Inspect one mismatched bucket
+
+After `verify` reports a mismatched bucket, drill into the affected PK window:
+
+```bash
+go run ./cmd/syncguard-cli inspect \
+  --publisher-dsn "$SYNCGUARD_PUBLISHER_DSN" \
+  --subscriber-dsn "$SYNCGUARD_SUBSCRIBER_DSN" \
+  --schema public \
+  --table my_table \
+  --bucket-id 42
+```
+
+This reads `syncguard.monitored_tables` to discover the PK column and bucket size, then compares the full rows inside that bucket range on publisher and subscriber.
+
+Note: `inspect` requires the CLI role to have direct `SELECT` on the target application table, not just on the `syncguard` schema objects.
+
+For each row-level divergence, `inspect` now also generates a suggested repair SQL plan for the subscriber:
+
+- `INSERT ... ON CONFLICT DO UPDATE` when the publisher row should be copied to the subscriber
+- `DELETE` when the subscriber has an extra row that is missing on the publisher
+
 ## Documentation
 
 - extension guide: `docs/PG_EXTENSION.md`
@@ -111,14 +133,16 @@ The current Go CLI foundation includes:
 - config loading from flags and environment variables
 - PostgreSQL connectivity using `pgx`
 - reads from `syncguard.bucket_catalog`
+- reads from `syncguard.monitored_tables`
 - publisher/subscriber bucket comparison
+- bucket-level row drill-down with `inspect`
+- suggested subscriber repair SQL from row-level diffs
 - text or JSON output
 - optional control-plane inserts for `validation_runs` and `divergence_log`
 
-The next CLI steps are drill-down, remediation planning, and packaging.
+The next CLI steps are controlled execution and packaging.
 
 ## Near-term roadmap
 
-- add drill-down logic below mismatched buckets
-- plan and execute remediation workflows from the CLI
+- execute approved remediation workflows from the CLI
 - package the CLI for `.rpm` / `.deb` delivery
