@@ -135,7 +135,7 @@ go run ./cmd/syncguard-cli repair \
 
 `repair` re-runs the bucket inspection, rebuilds the repair plan, and applies the statements to the subscriber in a single transaction. It never runs implicitly as part of `verify` or `inspect`.
 
-Note: because subscriber-side repairs fire SyncGuard's dirty-bucket trigger, the CLI role currently also needs the corresponding write privileges on the subscriber's `syncguard` internal tables. See `docs/REQUIRED_GRANTS.md`.
+Note: subscriber-side repairs fire SyncGuard's dirty-bucket trigger. In the current codebase, those helper functions are meant to run with extension-owner privileges, so the CLI repair role should only need DML rights on the target subscriber table plus the read access documented in `docs/REQUIRED_GRANTS.md`.
 
 ## Documentation
 

@@ -83,6 +83,8 @@ extension_sql!(
         p_bucket_size BIGINT
     ) RETURNS void
     LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, syncguard
     AS $$
     DECLARE
         v_bucket_id BIGINT;
@@ -117,6 +119,8 @@ extension_sql!(
     CREATE OR REPLACE FUNCTION syncguard.mark_dirty_trigger()
     RETURNS trigger
     LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, syncguard
     AS $$
     DECLARE
         v_pk_column   TEXT;

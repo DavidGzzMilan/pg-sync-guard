@@ -84,22 +84,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 GRANT INSERT, UPDATE, DELETE ON TABLES TO syncguard_reader;
 ```
 
-Under the current extension implementation, `repair` also fires `syncguard_dirty_bucket_trigger` on the subscriber table. That trigger calls `syncguard.mark_dirty_trigger()` and `syncguard.enqueue_dirty_bucket()`, which update SyncGuard's internal state tables. So the CLI role also needs enough privilege for that trigger path on the **subscriber**:
-
-```sql
-GRANT USAGE ON SCHEMA syncguard TO syncguard_reader;
-GRANT SELECT ON syncguard.monitored_tables TO syncguard_reader;
-GRANT SELECT, UPDATE ON syncguard.bucket_catalog TO syncguard_reader;
-GRANT SELECT, INSERT, UPDATE ON syncguard.dirty_buckets TO syncguard_reader;
-```
-
-Without those grants, repairs can fail with errors like:
-
-```text
-permission denied for table dirty_buckets
-```
-
-This extra requirement is specifically about the current trigger-based dirty-bucket implementation on the subscriber. A tighter long-term design would be to make the helper functions run with extension-owner privileges, so the CLI role would only need rights on the target application table.
+The extension's dirty-bucket helper functions are intended to run with extension-owner privileges. That means the CLI repair role should only need the subscriber-table DML above, not direct write privileges on `syncguard.dirty_buckets` or `syncguard.bucket_catalog`, as long as the database is running an up-to-date extension build.
 
 ## Registration / administration role
 
@@ -145,7 +130,6 @@ However:
 - the registration/admin role needs enough rights on the target tables to install the trigger
 - the CLI role needs direct `SELECT` on the target tables if it will use `inspect` for row-level drill-down
 - the CLI role needs `INSERT`, `UPDATE`, and `DELETE` on the subscriber target tables if it will use `repair`
-- the CLI role also needs the trigger-path rights above on the subscriber because repairs enqueue dirty buckets
 
 ## Control plane (optional)
 
