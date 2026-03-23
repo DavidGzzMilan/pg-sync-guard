@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/compare"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/repairplan"
@@ -12,7 +13,8 @@ import (
 func WriteText(w io.Writer, publisherName, subscriberName string, summary compare.Summary) error {
 	if _, err := fmt.Fprintf(
 		w,
-		"Compared %d bucket(s) between %s and %s.\n",
+		"Compared %d/%d bucket(s) between %s and %s.\n",
+		summary.ComparedBuckets,
 		summary.TotalBuckets,
 		publisherName,
 		subscriberName,
@@ -20,7 +22,33 @@ func WriteText(w io.Writer, publisherName, subscriberName string, summary compar
 		return err
 	}
 
+	if summary.ConsistencyMode != "" && summary.ConsistencyMode != "raw" {
+		if _, err := fmt.Fprintf(
+			w,
+			"Consistency mode=%s snapshot_status=%s skipped=%d cutoff=%s retries=%d pub_dirty=%d sub_dirty=%d.\n",
+			summary.ConsistencyMode,
+			summary.SnapshotStatus,
+			summary.SkippedBuckets,
+			formatTime(summary.SharedCutoffAt),
+			summary.StabilizationRetriesUsed,
+			summary.PublisherDirtyQueueCount,
+			summary.SubscriberDirtyQueueCount,
+		); err != nil {
+			return err
+		}
+	}
+
+	if summary.SnapshotStatus == "unstable_snapshot" {
+		if _, err := fmt.Fprintln(w, "Snapshot did not stabilize during verification; results may be incomplete."); err != nil {
+			return err
+		}
+	}
+
 	if summary.MismatchedBuckets == 0 {
+		if summary.SkippedBuckets > 0 {
+			_, err := fmt.Fprintln(w, "No mismatched buckets found among the compared stable buckets.")
+			return err
+		}
 		_, err := fmt.Fprintln(w, "No mismatched buckets found.")
 		return err
 	}
@@ -161,4 +189,11 @@ func formatInt(value *int64) string {
 		return "null"
 	}
 	return fmt.Sprintf("%d", *value)
+}
+
+func formatTime(value *time.Time) string {
+	if value == nil {
+		return "null"
+	}
+	return value.Format(time.RFC3339Nano)
 }

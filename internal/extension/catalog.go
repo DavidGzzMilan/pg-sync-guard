@@ -46,6 +46,13 @@ type BucketRow struct {
 	RowData json.RawMessage `json:"row_data"`
 }
 
+type VerificationMetadata struct {
+	DatabaseTime        time.Time  `json:"database_time"`
+	NaptimeMS           int        `json:"naptime_ms"`
+	DirtyQueueCount     int        `json:"dirty_queue_count"`
+	OldestDirtyQueuedAt *time.Time `json:"oldest_dirty_queued_at,omitempty"`
+}
+
 func CurrentDatabaseName(ctx context.Context, pool *pgxpool.Pool) (string, error) {
 	var dbName string
 	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&dbName); err != nil {
@@ -102,6 +109,83 @@ ORDER BY schema_name, table_name, bucket_id`
 	}
 
 	return buckets, nil
+}
+
+func FetchStableBucketCatalog(ctx context.Context, pool *pgxpool.Pool, schema, table string, cutoff time.Time) ([]BucketHash, error) {
+	const sql = `
+SELECT
+    schema_name,
+    table_name,
+    bucket_id,
+    pk_start,
+    pk_end,
+    row_count,
+    bucket_hash,
+    dirty,
+    last_computed_at,
+    reviewed_at
+FROM syncguard.bucket_catalog
+WHERE dirty = false
+  AND last_computed_at <= $3
+  AND ($1 = '' OR schema_name = $1)
+  AND ($2 = '' OR table_name = $2)
+ORDER BY schema_name, table_name, bucket_id`
+
+	rows, err := pool.Query(ctx, sql, strings.TrimSpace(schema), strings.TrimSpace(table), cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("query stable bucket_catalog: %w", err)
+	}
+	defer rows.Close()
+
+	var buckets []BucketHash
+	for rows.Next() {
+		var bucket BucketHash
+		if err := rows.Scan(
+			&bucket.SchemaName,
+			&bucket.TableName,
+			&bucket.BucketID,
+			&bucket.PKStart,
+			&bucket.PKEnd,
+			&bucket.RowCount,
+			&bucket.BucketHash,
+			&bucket.Dirty,
+			&bucket.LastComputedAt,
+			&bucket.ReviewedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan stable bucket_catalog row: %w", err)
+		}
+		buckets = append(buckets, bucket)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate stable bucket_catalog rows: %w", err)
+	}
+
+	return buckets, nil
+}
+
+func FetchVerificationMetadata(ctx context.Context, pool *pgxpool.Pool, schema, table string) (VerificationMetadata, error) {
+	const sql = `
+SELECT
+    now() AS database_time,
+    COALESCE(NULLIF(current_setting('syncguard.naptime_ms', true), '')::integer, 0) AS naptime_ms,
+    COUNT(*)::bigint AS dirty_queue_count,
+    MIN(queued_at) AS oldest_dirty_queued_at
+FROM syncguard.dirty_buckets
+WHERE ($1 = '' OR schema_name = $1)
+  AND ($2 = '' OR table_name = $2)`
+
+	var metadata VerificationMetadata
+	var dirtyCount int64
+	if err := pool.QueryRow(ctx, sql, strings.TrimSpace(schema), strings.TrimSpace(table)).Scan(
+		&metadata.DatabaseTime,
+		&metadata.NaptimeMS,
+		&dirtyCount,
+		&metadata.OldestDirtyQueuedAt,
+	); err != nil {
+		return VerificationMetadata{}, fmt.Errorf("query verification metadata: %w", err)
+	}
+	metadata.DirtyQueueCount = int(dirtyCount)
+	return metadata, nil
 }
 
 func FetchMonitoredTable(ctx context.Context, pool *pgxpool.Pool, schema, table string) (MonitoredTable, error) {

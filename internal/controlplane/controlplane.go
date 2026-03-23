@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/compare"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -24,18 +25,21 @@ func WriteVerifyRun(
 	defer tx.Rollback(ctx)
 
 	var runID string
+	notes := buildNotes(summary)
 	err = tx.QueryRow(ctx, `
 INSERT INTO syncguard.validation_runs (
     publisher_name,
     subscriber_name,
     table_filter,
-    status
+    status,
+    notes
 )
-VALUES ($1, $2, NULLIF($3, ''), 'running')
+VALUES ($1, $2, NULLIF($3, ''), 'running', NULLIF($4, ''))
 RETURNING run_id`,
 		publisherName,
 		subscriberName,
 		strings.TrimSpace(tableFilter),
+		notes,
 	).Scan(&runID)
 	if err != nil {
 		return fmt.Errorf("insert validation run: %w", err)
@@ -74,7 +78,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open')`,
 	}
 
 	status := "success"
-	if summary.MismatchedBuckets > 0 {
+	if summary.SnapshotStatus == "unstable_snapshot" {
+		status = "failed"
+	} else if summary.MismatchedBuckets > 0 {
 		status = "diverged"
 	}
 
@@ -83,12 +89,14 @@ UPDATE syncguard.validation_runs
 SET total_buckets_compared = $2,
     mismatched_buckets = $3,
     status = $4,
+    notes = NULLIF($5, ''),
     finished_at = now()
 WHERE run_id = $1`,
 		runID,
-		summary.TotalBuckets,
+		comparisonCount(summary),
 		summary.MismatchedBuckets,
 		status,
+		notes,
 	)
 	if err != nil {
 		return fmt.Errorf("finalize validation run: %w", err)
@@ -109,4 +117,34 @@ func valueOrZero(value *int64) int64 {
 
 func valueOrNil[T any](value *T) *T {
 	return value
+}
+
+func comparisonCount(summary compare.Summary) int {
+	if summary.ComparedBuckets > 0 || summary.ConsistencyMode != "" {
+		return summary.ComparedBuckets
+	}
+	return summary.TotalBuckets
+}
+
+func buildNotes(summary compare.Summary) string {
+	if summary.ConsistencyMode == "" || summary.ConsistencyMode == "raw" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"mode=%s snapshot_status=%s skipped=%d cutoff=%s retries=%d pub_dirty=%d sub_dirty=%d",
+		summary.ConsistencyMode,
+		summary.SnapshotStatus,
+		summary.SkippedBuckets,
+		formatTime(summary.SharedCutoffAt),
+		summary.StabilizationRetriesUsed,
+		summary.PublisherDirtyQueueCount,
+		summary.SubscriberDirtyQueueCount,
+	)
+}
+
+func formatTime(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }

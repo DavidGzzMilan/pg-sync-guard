@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/extension"
 )
@@ -29,9 +30,32 @@ type BucketDiff struct {
 }
 
 type Summary struct {
-	TotalBuckets      int          `json:"total_buckets"`
-	MismatchedBuckets int          `json:"mismatched_buckets"`
-	Diffs             []BucketDiff `json:"diffs"`
+	TotalBuckets              int          `json:"total_buckets"`
+	ComparedBuckets           int          `json:"compared_buckets"`
+	SkippedBuckets            int          `json:"skipped_buckets"`
+	SkippedOnPublisher        int          `json:"skipped_on_publisher"`
+	SkippedOnSubscriber       int          `json:"skipped_on_subscriber"`
+	MismatchedBuckets         int          `json:"mismatched_buckets"`
+	Diffs                     []BucketDiff `json:"diffs"`
+	ConsistencyMode           string       `json:"consistency_mode,omitempty"`
+	SnapshotStatus            string       `json:"snapshot_status,omitempty"`
+	PublisherCapturedAt       *time.Time   `json:"publisher_captured_at,omitempty"`
+	SubscriberCapturedAt      *time.Time   `json:"subscriber_captured_at,omitempty"`
+	SharedCutoffAt            *time.Time   `json:"shared_cutoff_at,omitempty"`
+	StabilizationRetriesUsed  int          `json:"stabilization_retries_used,omitempty"`
+	PublisherDirtyQueueCount  int          `json:"publisher_dirty_queue_count,omitempty"`
+	SubscriberDirtyQueueCount int          `json:"subscriber_dirty_queue_count,omitempty"`
+}
+
+type StableCompareMetadata struct {
+	ConsistencyMode           string
+	SnapshotStatus            string
+	PublisherCapturedAt       *time.Time
+	SubscriberCapturedAt      *time.Time
+	SharedCutoffAt            *time.Time
+	StabilizationRetriesUsed  int
+	PublisherDirtyQueueCount  int
+	SubscriberDirtyQueueCount int
 }
 
 type RowDiff struct {
@@ -85,7 +109,12 @@ func CompareBuckets(publisher, subscriber []extension.BucketHash) Summary {
 		return keys[i].BucketID < keys[j].BucketID
 	})
 
-	summary := Summary{TotalBuckets: len(keys)}
+	summary := Summary{
+		TotalBuckets:    len(keys),
+		ComparedBuckets: len(keys),
+		ConsistencyMode: "raw",
+		SnapshotStatus:  "raw",
+	}
 	for _, key := range keys {
 		pub, pubOK := pubByKey[key]
 		sub, subOK := subByKey[key]
@@ -132,6 +161,81 @@ func CompareBuckets(publisher, subscriber []extension.BucketHash) Summary {
 			}
 			summary.Diffs = append(summary.Diffs, diff)
 		}
+	}
+
+	summary.MismatchedBuckets = len(summary.Diffs)
+	return summary
+}
+
+func CompareStableBuckets(
+	publisherAll []extension.BucketHash,
+	subscriberAll []extension.BucketHash,
+	publisherStable []extension.BucketHash,
+	subscriberStable []extension.BucketHash,
+	metadata StableCompareMetadata,
+) Summary {
+	pubAllKeys := bucketSetKeys(publisherAll)
+	subAllKeys := bucketSetKeys(subscriberAll)
+	pubStableByKey := bucketSetMap(publisherStable)
+	subStableByKey := bucketSetMap(subscriberStable)
+	allKeys := unionKeys(pubAllKeys, subAllKeys)
+
+	sort.Slice(allKeys, func(i, j int) bool {
+		if allKeys[i].SchemaName != allKeys[j].SchemaName {
+			return allKeys[i].SchemaName < allKeys[j].SchemaName
+		}
+		if allKeys[i].TableName != allKeys[j].TableName {
+			return allKeys[i].TableName < allKeys[j].TableName
+		}
+		return allKeys[i].BucketID < allKeys[j].BucketID
+	})
+
+	summary := Summary{
+		TotalBuckets:              len(allKeys),
+		ConsistencyMode:           metadata.ConsistencyMode,
+		SnapshotStatus:            metadata.SnapshotStatus,
+		PublisherCapturedAt:       metadata.PublisherCapturedAt,
+		SubscriberCapturedAt:      metadata.SubscriberCapturedAt,
+		SharedCutoffAt:            metadata.SharedCutoffAt,
+		StabilizationRetriesUsed:  metadata.StabilizationRetriesUsed,
+		PublisherDirtyQueueCount:  metadata.PublisherDirtyQueueCount,
+		SubscriberDirtyQueueCount: metadata.SubscriberDirtyQueueCount,
+	}
+
+	for _, key := range allKeys {
+		pub, pubStable := pubStableByKey[key]
+		sub, subStable := subStableByKey[key]
+
+		if !pubStable || !subStable {
+			summary.SkippedBuckets++
+			if !pubStable {
+				summary.SkippedOnPublisher++
+			}
+			if !subStable {
+				summary.SkippedOnSubscriber++
+			}
+			continue
+		}
+
+		summary.ComparedBuckets++
+		status := classify(pub, sub)
+		if status == "match" {
+			continue
+		}
+
+		diff := BucketDiff{
+			SchemaName:      key.SchemaName,
+			TableName:       key.TableName,
+			BucketID:        key.BucketID,
+			PKStart:         chooseRange(pub.PKStart, sub.PKStart),
+			PKEnd:           chooseRange(pub.PKEnd, sub.PKEnd),
+			PublisherHash:   pub.BucketHash,
+			SubscriberHash:  sub.BucketHash,
+			PublisherCount:  &pub.RowCount,
+			SubscriberCount: &sub.RowCount,
+			Status:          status,
+		}
+		summary.Diffs = append(summary.Diffs, diff)
 	}
 
 	summary.MismatchedBuckets = len(summary.Diffs)
@@ -247,4 +351,36 @@ func cloneBytes(value []byte) json.RawMessage {
 	out := make([]byte, len(value))
 	copy(out, value)
 	return json.RawMessage(out)
+}
+
+func bucketSetMap(buckets []extension.BucketHash) map[BucketKey]extension.BucketHash {
+	byKey := make(map[BucketKey]extension.BucketHash, len(buckets))
+	for _, bucket := range buckets {
+		key := BucketKey{SchemaName: bucket.SchemaName, TableName: bucket.TableName, BucketID: bucket.BucketID}
+		byKey[key] = bucket
+	}
+	return byKey
+}
+
+func bucketSetKeys(buckets []extension.BucketHash) []BucketKey {
+	keys := make([]BucketKey, 0, len(buckets))
+	for _, bucket := range buckets {
+		keys = append(keys, BucketKey{SchemaName: bucket.SchemaName, TableName: bucket.TableName, BucketID: bucket.BucketID})
+	}
+	return keys
+}
+
+func unionKeys(left, right []BucketKey) []BucketKey {
+	union := make(map[BucketKey]struct{}, len(left)+len(right))
+	for _, key := range left {
+		union[key] = struct{}{}
+	}
+	for _, key := range right {
+		union[key] = struct{}{}
+	}
+	keys := make([]BucketKey, 0, len(union))
+	for key := range union {
+		keys = append(keys, key)
+	}
+	return keys
 }

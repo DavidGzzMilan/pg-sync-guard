@@ -11,6 +11,7 @@ import (
 
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/compare"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/config"
+	"github.com/DavidGzzMilan/pg-sync-guard/internal/consistency"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/controlplane"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/db"
 	"github.com/DavidGzzMilan/pg-sync-guard/internal/extension"
@@ -55,10 +56,8 @@ func runVerify(args []string) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop, cancel := commandContext()
 	defer stop()
-
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	pubPool, err := db.Connect(ctx, cfg.PublisherDSN)
@@ -73,24 +72,19 @@ func runVerify(args []string) error {
 	}
 	defer subPool.Close()
 
-	publisherBuckets, err := extension.FetchBucketCatalog(ctx, pubPool, cfg.Schema, cfg.Table)
-	if err != nil {
-		return fmt.Errorf("fetch publisher buckets: %w", err)
-	}
 	publisherName, err := extension.CurrentDatabaseName(ctx, pubPool)
 	if err != nil {
 		return fmt.Errorf("fetch publisher database name: %w", err)
-	}
-	subscriberBuckets, err := extension.FetchBucketCatalog(ctx, subPool, cfg.Schema, cfg.Table)
-	if err != nil {
-		return fmt.Errorf("fetch subscriber buckets: %w", err)
 	}
 	subscriberName, err := extension.CurrentDatabaseName(ctx, subPool)
 	if err != nil {
 		return fmt.Errorf("fetch subscriber database name: %w", err)
 	}
 
-	summary := compare.CompareBuckets(publisherBuckets, subscriberBuckets)
+	summary, err := verifySummary(ctx, pubPool, subPool, cfg)
+	if err != nil {
+		return err
+	}
 
 	if cfg.JSON {
 		if err := report.WriteJSON(os.Stdout, publisherName, subscriberName, summary); err != nil {
@@ -121,6 +115,9 @@ func runVerify(args []string) error {
 		}
 	}
 
+	if summary.SnapshotStatus == "unstable_snapshot" {
+		return errors.New("stable-watermark snapshot did not stabilize")
+	}
 	if summary.MismatchedBuckets > 0 {
 		return errors.New("bucket mismatches found")
 	}
@@ -284,6 +281,145 @@ func inspectAndPlan(
 	return publisherName, subscriberName, summary, nil
 }
 
+func verifySummary(ctx context.Context, pubPool, subPool *pgxpool.Pool, cfg *config.VerifyConfig) (compare.Summary, error) {
+	switch cfg.ConsistencyMode {
+	case consistency.ModeRaw:
+		publisherBuckets, err := extension.FetchBucketCatalog(ctx, pubPool, cfg.Schema, cfg.Table)
+		if err != nil {
+			return compare.Summary{}, fmt.Errorf("fetch publisher buckets: %w", err)
+		}
+		subscriberBuckets, err := extension.FetchBucketCatalog(ctx, subPool, cfg.Schema, cfg.Table)
+		if err != nil {
+			return compare.Summary{}, fmt.Errorf("fetch subscriber buckets: %w", err)
+		}
+		return compare.CompareBuckets(publisherBuckets, subscriberBuckets), nil
+	case consistency.ModeStableWatermark:
+		return verifyStableWatermark(ctx, pubPool, subPool, cfg)
+	default:
+		return compare.Summary{}, fmt.Errorf("unsupported consistency mode: %s", cfg.ConsistencyMode)
+	}
+}
+
+func verifyStableWatermark(ctx context.Context, pubPool, subPool *pgxpool.Pool, cfg *config.VerifyConfig) (compare.Summary, error) {
+	var previous *verifyRead
+
+	for attempt := 0; attempt <= cfg.StabilityRetries; attempt++ {
+		current, err := readStableWatermarkSnapshot(ctx, pubPool, subPool, cfg)
+		if err != nil {
+			return compare.Summary{}, err
+		}
+
+		if previous == nil {
+			if cfg.StabilityRetries == 0 {
+				return stableSummaryFromRead(current, 0, false), nil
+			}
+			previous = &current
+			continue
+		}
+
+		if consistency.EqualEligibleBuckets(previous.publisherStable, current.publisherStable) &&
+			consistency.EqualEligibleBuckets(previous.subscriberStable, current.subscriberStable) {
+			return stableSummaryFromRead(current, attempt, true), nil
+		}
+
+		previous = &current
+	}
+
+	if previous == nil {
+		return compare.Summary{}, errors.New("failed to collect stable-watermark snapshot")
+	}
+	return stableSummaryFromRead(*previous, cfg.StabilityRetries, false), nil
+}
+
+func readStableWatermarkSnapshot(ctx context.Context, pubPool, subPool *pgxpool.Pool, cfg *config.VerifyConfig) (verifyRead, error) {
+	var snapshot verifyRead
+
+	var err error
+	snapshot.publisherMetadata, err = extension.FetchVerificationMetadata(ctx, pubPool, cfg.Schema, cfg.Table)
+	if err != nil {
+		return snapshot, fmt.Errorf("fetch publisher verification metadata: %w", err)
+	}
+	snapshot.subscriberMetadata, err = extension.FetchVerificationMetadata(ctx, subPool, cfg.Schema, cfg.Table)
+	if err != nil {
+		return snapshot, fmt.Errorf("fetch subscriber verification metadata: %w", err)
+	}
+
+	snapshot.window = consistency.ComputeWatermark(
+		consistency.SideSnapshot{
+			CapturedAt:        snapshot.publisherMetadata.DatabaseTime,
+			NaptimeMS:         snapshot.publisherMetadata.NaptimeMS,
+			DirtyQueueCount:   snapshot.publisherMetadata.DirtyQueueCount,
+			OldestDirtyQueued: snapshot.publisherMetadata.OldestDirtyQueuedAt,
+		},
+		consistency.SideSnapshot{
+			CapturedAt:        snapshot.subscriberMetadata.DatabaseTime,
+			NaptimeMS:         snapshot.subscriberMetadata.NaptimeMS,
+			DirtyQueueCount:   snapshot.subscriberMetadata.DirtyQueueCount,
+			OldestDirtyQueued: snapshot.subscriberMetadata.OldestDirtyQueuedAt,
+		},
+		time.Duration(cfg.StabilityBufferMS)*time.Millisecond,
+	)
+
+	snapshot.publisherBuckets, err = extension.FetchBucketCatalog(ctx, pubPool, cfg.Schema, cfg.Table)
+	if err != nil {
+		return snapshot, fmt.Errorf("fetch publisher buckets: %w", err)
+	}
+	snapshot.subscriberBuckets, err = extension.FetchBucketCatalog(ctx, subPool, cfg.Schema, cfg.Table)
+	if err != nil {
+		return snapshot, fmt.Errorf("fetch subscriber buckets: %w", err)
+	}
+	snapshot.publisherStable, err = extension.FetchStableBucketCatalog(ctx, pubPool, cfg.Schema, cfg.Table, snapshot.window.SharedCutoffAt)
+	if err != nil {
+		return snapshot, fmt.Errorf("fetch publisher stable buckets: %w", err)
+	}
+	snapshot.subscriberStable, err = extension.FetchStableBucketCatalog(ctx, subPool, cfg.Schema, cfg.Table, snapshot.window.SharedCutoffAt)
+	if err != nil {
+		return snapshot, fmt.Errorf("fetch subscriber stable buckets: %w", err)
+	}
+
+	return snapshot, nil
+}
+
+func stableSummaryFromRead(read verifyRead,
+	retriesUsed int,
+	stable bool,
+) compare.Summary {
+	publisherCapturedAt := read.publisherMetadata.DatabaseTime
+	subscriberCapturedAt := read.subscriberMetadata.DatabaseTime
+	sharedCutoff := read.window.SharedCutoffAt
+	status := "stable"
+	if !stable {
+		status = "unstable_snapshot"
+	}
+
+	return compare.CompareStableBuckets(
+		read.publisherBuckets,
+		read.subscriberBuckets,
+		read.publisherStable,
+		read.subscriberStable,
+		compare.StableCompareMetadata{
+			ConsistencyMode:           consistency.ModeStableWatermark,
+			SnapshotStatus:            status,
+			PublisherCapturedAt:       &publisherCapturedAt,
+			SubscriberCapturedAt:      &subscriberCapturedAt,
+			SharedCutoffAt:            &sharedCutoff,
+			StabilizationRetriesUsed:  retriesUsed,
+			PublisherDirtyQueueCount:  read.publisherMetadata.DirtyQueueCount,
+			SubscriberDirtyQueueCount: read.subscriberMetadata.DirtyQueueCount,
+		},
+	)
+}
+
+type verifyRead struct {
+	publisherMetadata  extension.VerificationMetadata
+	subscriberMetadata extension.VerificationMetadata
+	publisherBuckets   []extension.BucketHash
+	subscriberBuckets  []extension.BucketHash
+	publisherStable    []extension.BucketHash
+	subscriberStable   []extension.BucketHash
+	window             consistency.Watermark
+}
+
 func usageError() error {
 	return errors.New(usageText())
 }
@@ -303,6 +439,9 @@ Flags for verify:
   --control-dsn           Optional PostgreSQL DSN for control plane
   --schema                Optional schema filter
   --table                 Optional table filter
+  --consistency-mode      Verification consistency mode: stable-watermark or raw
+  --stability-buffer-ms   Extra safety buffer in milliseconds for stable-watermark
+  --stability-retries     Number of stabilization re-reads for stable-watermark
   --json                  Emit JSON output
   --write-control-plane   Persist run results to control plane
 
@@ -328,6 +467,9 @@ Environment variables:
   SYNCGUARD_CONTROL_DSN
   SYNCGUARD_SCHEMA
   SYNCGUARD_TABLE
+  SYNCGUARD_CONSISTENCY_MODE
+  SYNCGUARD_STABILITY_BUFFER_MS
+  SYNCGUARD_STABILITY_RETRIES
   SYNCGUARD_JSON
   SYNCGUARD_WRITE_CONTROL_PLANE`
 }

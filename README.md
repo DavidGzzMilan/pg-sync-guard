@@ -95,8 +95,20 @@ Optional flags:
 
 - `--schema public`
 - `--table my_table`
+- `--consistency-mode stable-watermark`
+- `--stability-buffer-ms 250`
+- `--stability-retries 1`
 - `--json`
 - `--control-dsn "$SYNCGUARD_CONTROL_DSN" --write-control-plane`
+
+`verify` now defaults to `stable-watermark` mode. In that mode, the CLI:
+
+- reads each side's database time and `syncguard.naptime_ms`
+- computes a conservative shared cutoff in the past
+- compares only buckets that are `dirty = false` and whose `last_computed_at` is older than that cutoff on both sides
+- optionally re-reads the eligible bucket set to see whether the snapshot stabilizes
+
+This is a best-effort consistency window that reduces false positives from in-flight rehashing. It is not a strict cross-node snapshot guarantee.
 
 ### 7. Inspect one mismatched bucket
 
@@ -152,6 +164,7 @@ The current Go CLI foundation includes:
 - reads from `syncguard.bucket_catalog`
 - reads from `syncguard.monitored_tables`
 - publisher/subscriber bucket comparison
+- stable-watermark verification mode with skipped unstable buckets
 - bucket-level row drill-down with `inspect`
 - suggested subscriber repair SQL from row-level diffs
 - explicit subscriber-side apply flow with `repair`
@@ -164,3 +177,8 @@ The next CLI steps are controlled execution and packaging.
 
 - execute approved remediation workflows from the CLI
 - package the CLI for `.rpm` / `.deb` delivery
+
+## Backlog
+
+- add a real extension upgrade path so SQL/object changes are applied through `ALTER EXTENSION UPDATE`
+- add a stronger extension-assisted epoch/barrier verification model for true coordinated cross-node comparisons

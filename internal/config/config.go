@@ -9,13 +9,16 @@ import (
 )
 
 type VerifyConfig struct {
-	PublisherDSN  string
-	SubscriberDSN string
-	ControlDSN    string
-	Schema        string
-	Table         string
-	JSON          bool
-	WriteControl  bool
+	PublisherDSN      string
+	SubscriberDSN     string
+	ControlDSN        string
+	Schema            string
+	Table             string
+	JSON              bool
+	WriteControl      bool
+	ConsistencyMode   string
+	StabilityBufferMS int
+	StabilityRetries  int
 }
 
 type InspectConfig struct {
@@ -47,6 +50,9 @@ func NewVerifyCommand() (*flag.FlagSet, *VerifyConfig) {
 	fs.StringVar(&cfg.Table, "table", getenv("SYNCGUARD_TABLE", ""), "Optional table filter")
 	fs.BoolVar(&cfg.JSON, "json", getenvBool("SYNCGUARD_JSON", false), "Emit JSON instead of text output")
 	fs.BoolVar(&cfg.WriteControl, "write-control-plane", getenvBool("SYNCGUARD_WRITE_CONTROL_PLANE", false), "Persist run results to the control plane")
+	fs.StringVar(&cfg.ConsistencyMode, "consistency-mode", getenv("SYNCGUARD_CONSISTENCY_MODE", "stable-watermark"), "Verification consistency mode: stable-watermark or raw")
+	fs.IntVar(&cfg.StabilityBufferMS, "stability-buffer-ms", getenvInt("SYNCGUARD_STABILITY_BUFFER_MS", 250), "Extra safety buffer in milliseconds for stable-watermark mode")
+	fs.IntVar(&cfg.StabilityRetries, "stability-retries", getenvInt("SYNCGUARD_STABILITY_RETRIES", 1), "Number of stabilization re-reads for stable-watermark mode")
 
 	return fs, cfg
 }
@@ -60,6 +66,17 @@ func (c *VerifyConfig) Validate() error {
 	}
 	if c.WriteControl && strings.TrimSpace(c.ControlDSN) == "" {
 		return errors.New("control DSN is required when --write-control-plane is set")
+	}
+	switch c.ConsistencyMode {
+	case "raw", "stable-watermark":
+	default:
+		return errors.New("consistency-mode must be 'raw' or 'stable-watermark'")
+	}
+	if c.StabilityBufferMS < 0 {
+		return errors.New("stability-buffer-ms must be zero or greater")
+	}
+	if c.StabilityRetries < 0 {
+		return errors.New("stability-retries must be zero or greater")
 	}
 	return nil
 }
@@ -159,4 +176,17 @@ func getenvBool(key string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func getenvInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	var parsed int
+	if _, err := fmt.Sscanf(value, "%d", &parsed); err != nil {
+		return fallback
+	}
+	return parsed
 }
