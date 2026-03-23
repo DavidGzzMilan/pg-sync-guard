@@ -98,6 +98,9 @@ Optional flags:
 - `--consistency-mode stable-watermark`
 - `--stability-buffer-ms 250`
 - `--stability-retries 1`
+- `--min-coverage-pct 80`
+- `--live-fallback-for-dirty`
+- `--live-fallback-dirty-age-ms 2000`
 - `--json`
 - `--control-dsn "$SYNCGUARD_CONTROL_DSN" --write-control-plane`
 
@@ -109,6 +112,22 @@ Optional flags:
 - optionally re-reads the eligible bucket set to see whether the snapshot stabilizes
 
 This is a best-effort consistency window that reduces false positives from in-flight rehashing. It is not a strict cross-node snapshot guarantee.
+
+If too many buckets are still unstable, `verify` now reports an explicit coverage warning instead of looking like a fully trustworthy clean run.
+
+For hotter tables, you can enable a more aggressive mode:
+
+```bash
+go run ./cmd/syncguard-cli verify \
+  --publisher-dsn "$SYNCGUARD_PUBLISHER_DSN" \
+  --subscriber-dsn "$SYNCGUARD_SUBSCRIBER_DSN" \
+  --consistency-mode stable-watermark \
+  --min-coverage-pct 80 \
+  --live-fallback-for-dirty \
+  --live-fallback-dirty-age-ms 2000
+```
+
+In that mode, buckets that remain dirty beyond the configured age threshold are foreground-hashed directly from the live publisher and subscriber tables, so long-dirty ranges do not stay invisible forever.
 
 ### 7. Inspect one mismatched bucket
 
@@ -165,6 +184,8 @@ The current Go CLI foundation includes:
 - reads from `syncguard.monitored_tables`
 - publisher/subscriber bucket comparison
 - stable-watermark verification mode with skipped unstable buckets
+- coverage warnings when stable verification sees too little of the catalog
+- optional live fallback hashing for long-dirty buckets
 - bucket-level row drill-down with `inspect`
 - suggested subscriber repair SQL from row-level diffs
 - explicit subscriber-side apply flow with `repair`

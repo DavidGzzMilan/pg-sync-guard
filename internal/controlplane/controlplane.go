@@ -131,14 +131,18 @@ func buildNotes(summary compare.Summary) string {
 		return ""
 	}
 	return fmt.Sprintf(
-		"mode=%s snapshot_status=%s skipped=%d cutoff=%s retries=%d pub_dirty=%d sub_dirty=%d",
+		"mode=%s snapshot_status=%s coverage_status=%s coverage_pct=%d min_coverage_pct=%d skipped=%d cutoff=%s retries=%d pub_dirty=%d sub_dirty=%d live_fallback=%d",
 		summary.ConsistencyMode,
 		summary.SnapshotStatus,
+		summary.CoverageStatus,
+		summary.CoveragePct,
+		summary.MinCoveragePct,
 		summary.SkippedBuckets,
 		formatTime(summary.SharedCutoffAt),
 		summary.StabilizationRetriesUsed,
 		summary.PublisherDirtyQueueCount,
 		summary.SubscriberDirtyQueueCount,
+		summary.LiveFallbackBuckets,
 	)
 }
 

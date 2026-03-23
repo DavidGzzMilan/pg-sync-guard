@@ -25,14 +25,16 @@ func WriteText(w io.Writer, publisherName, subscriberName string, summary compar
 	if summary.ConsistencyMode != "" && summary.ConsistencyMode != "raw" {
 		if _, err := fmt.Fprintf(
 			w,
-			"Consistency mode=%s snapshot_status=%s skipped=%d cutoff=%s retries=%d pub_dirty=%d sub_dirty=%d.\n",
+			"Consistency mode=%s snapshot_status=%s coverage=%d%% skipped=%d cutoff=%s retries=%d pub_dirty=%d sub_dirty=%d live_fallback=%d.\n",
 			summary.ConsistencyMode,
 			summary.SnapshotStatus,
+			summary.CoveragePct,
 			summary.SkippedBuckets,
 			formatTime(summary.SharedCutoffAt),
 			summary.StabilizationRetriesUsed,
 			summary.PublisherDirtyQueueCount,
 			summary.SubscriberDirtyQueueCount,
+			summary.LiveFallbackBuckets,
 		); err != nil {
 			return err
 		}
@@ -40,6 +42,11 @@ func WriteText(w io.Writer, publisherName, subscriberName string, summary compar
 
 	if summary.SnapshotStatus == "unstable_snapshot" {
 		if _, err := fmt.Fprintln(w, "Snapshot did not stabilize during verification; results may be incomplete."); err != nil {
+			return err
+		}
+	}
+	if summary.CoverageStatus == "incomplete_coverage" {
+		if _, err := fmt.Fprintf(w, "Coverage warning: compared coverage %d%% is below configured threshold %d%%.\n", summary.CoveragePct, summary.MinCoveragePct); err != nil {
 			return err
 		}
 	}

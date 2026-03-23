@@ -53,6 +53,16 @@ type VerificationMetadata struct {
 	OldestDirtyQueuedAt *time.Time `json:"oldest_dirty_queued_at,omitempty"`
 }
 
+type DirtyBucket struct {
+	SchemaName string    `json:"schema_name"`
+	TableName  string    `json:"table_name"`
+	BucketID   int64     `json:"bucket_id"`
+	PKStart    int64     `json:"pk_start"`
+	PKEnd      int64     `json:"pk_end"`
+	QueuedAt   time.Time `json:"queued_at"`
+	PKColumn   string    `json:"pk_column"`
+}
+
 func CurrentDatabaseName(ctx context.Context, pool *pgxpool.Pool) (string, error) {
 	var dbName string
 	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&dbName); err != nil {
@@ -188,6 +198,54 @@ WHERE ($1 = '' OR schema_name = $1)
 	return metadata, nil
 }
 
+func FetchDirtyBucketsOlderThan(ctx context.Context, pool *pgxpool.Pool, schema, table string, olderThan time.Time) ([]DirtyBucket, error) {
+	const sql = `
+SELECT
+    d.schema_name,
+    d.table_name,
+    d.bucket_id,
+    d.pk_start,
+    d.pk_end,
+    d.queued_at,
+    m.pk_column
+FROM syncguard.dirty_buckets d
+JOIN syncguard.monitored_tables m
+  ON m.schema_name = d.schema_name
+ AND m.table_name = d.table_name
+WHERE d.queued_at <= $3
+  AND ($1 = '' OR d.schema_name = $1)
+  AND ($2 = '' OR d.table_name = $2)
+ORDER BY d.queued_at, d.schema_name, d.table_name, d.bucket_id`
+
+	rows, err := pool.Query(ctx, sql, strings.TrimSpace(schema), strings.TrimSpace(table), olderThan)
+	if err != nil {
+		return nil, fmt.Errorf("query dirty buckets older than threshold: %w", err)
+	}
+	defer rows.Close()
+
+	var buckets []DirtyBucket
+	for rows.Next() {
+		var bucket DirtyBucket
+		if err := rows.Scan(
+			&bucket.SchemaName,
+			&bucket.TableName,
+			&bucket.BucketID,
+			&bucket.PKStart,
+			&bucket.PKEnd,
+			&bucket.QueuedAt,
+			&bucket.PKColumn,
+		); err != nil {
+			return nil, fmt.Errorf("scan dirty bucket: %w", err)
+		}
+		buckets = append(buckets, bucket)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dirty buckets: %w", err)
+	}
+
+	return buckets, nil
+}
+
 func FetchMonitoredTable(ctx context.Context, pool *pgxpool.Pool, schema, table string) (MonitoredTable, error) {
 	const sql = `
 SELECT
@@ -291,6 +349,41 @@ ORDER BY a.attnum`
 	return columns, nil
 }
 
+func FetchLiveBucketHash(ctx context.Context, pool *pgxpool.Pool, meta MonitoredTable, pkStart, pkEnd int64) (BucketHash, error) {
+	sql := fmt.Sprintf(
+		`WITH b AS (
+    SELECT md5(row_to_json(t)::text) AS h
+    FROM %s AS t
+    WHERE t.%s >= $1 AND t.%s < $2
+    ORDER BY t.%s
+)
+SELECT count(*)::bigint, md5(string_agg(h, '' ORDER BY h))
+FROM b`,
+		quoteQualifiedIdentifier(meta.SchemaName, meta.TableName),
+		quoteIdentifier(meta.PKColumn),
+		quoteIdentifier(meta.PKColumn),
+		quoteIdentifier(meta.PKColumn),
+	)
+
+	var rowCount int64
+	var bucketHash *string
+	if err := pool.QueryRow(ctx, sql, pkStart, pkEnd).Scan(&rowCount, &bucketHash); err != nil {
+		return BucketHash{}, fmt.Errorf("query live bucket hash: %w", err)
+	}
+
+	return BucketHash{
+		SchemaName:     meta.SchemaName,
+		TableName:      meta.TableName,
+		BucketID:       bucketIDFromRange(pkStart, meta.BucketSize),
+		PKStart:        pkStart,
+		PKEnd:          pkEnd,
+		RowCount:       rowCount,
+		BucketHash:     bucketHash,
+		Dirty:          false,
+		LastComputedAt: time.Now().UTC(),
+	}, nil
+}
+
 func WorkerRunning(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 	var running bool
 	if err := pool.QueryRow(ctx, "SELECT syncguard_worker_running()").Scan(&running); err != nil {
@@ -305,4 +398,11 @@ func quoteIdentifier(identifier string) string {
 
 func quoteQualifiedIdentifier(schemaName, tableName string) string {
 	return quoteIdentifier(schemaName) + "." + quoteIdentifier(tableName)
+}
+
+func bucketIDFromRange(pkStart, bucketSize int64) int64 {
+	if bucketSize <= 0 {
+		return 0
+	}
+	return pkStart / bucketSize
 }

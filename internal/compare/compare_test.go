@@ -136,3 +136,40 @@ func TestCompareStableBucketsSkipsUnstableBuckets(t *testing.T) {
 		t.Fatalf("expected stable snapshot status, got %s", summary.SnapshotStatus)
 	}
 }
+
+func TestFinalizeCoverageMarksIncomplete(t *testing.T) {
+	summary := Summary{
+		TotalBuckets:    10,
+		ComparedBuckets: 6,
+		SnapshotStatus:  "stable",
+	}
+
+	FinalizeCoverage(&summary, 80)
+
+	if summary.CoveragePct != 60 {
+		t.Fatalf("expected coverage 60, got %d", summary.CoveragePct)
+	}
+	if summary.CoverageStatus != "incomplete_coverage" {
+		t.Fatalf("expected incomplete_coverage, got %s", summary.CoverageStatus)
+	}
+	if summary.SnapshotStatus != "incomplete_coverage" {
+		t.Fatalf("expected snapshot status to become incomplete_coverage, got %s", summary.SnapshotStatus)
+	}
+}
+
+func TestFinalizeCoverageLeavesUnstableSnapshot(t *testing.T) {
+	summary := Summary{
+		TotalBuckets:    10,
+		ComparedBuckets: 6,
+		SnapshotStatus:  "unstable_snapshot",
+	}
+
+	FinalizeCoverage(&summary, 80)
+
+	if summary.CoverageStatus != "incomplete_coverage" {
+		t.Fatalf("expected incomplete_coverage, got %s", summary.CoverageStatus)
+	}
+	if summary.SnapshotStatus != "unstable_snapshot" {
+		t.Fatalf("expected unstable_snapshot to remain, got %s", summary.SnapshotStatus)
+	}
+}

@@ -19,6 +19,9 @@ type VerifyConfig struct {
 	ConsistencyMode   string
 	StabilityBufferMS int
 	StabilityRetries  int
+	MinCoveragePct    int
+	LiveFallback      bool
+	LiveFallbackAgeMS int
 }
 
 type InspectConfig struct {
@@ -53,6 +56,9 @@ func NewVerifyCommand() (*flag.FlagSet, *VerifyConfig) {
 	fs.StringVar(&cfg.ConsistencyMode, "consistency-mode", getenv("SYNCGUARD_CONSISTENCY_MODE", "stable-watermark"), "Verification consistency mode: stable-watermark or raw")
 	fs.IntVar(&cfg.StabilityBufferMS, "stability-buffer-ms", getenvInt("SYNCGUARD_STABILITY_BUFFER_MS", 250), "Extra safety buffer in milliseconds for stable-watermark mode")
 	fs.IntVar(&cfg.StabilityRetries, "stability-retries", getenvInt("SYNCGUARD_STABILITY_RETRIES", 1), "Number of stabilization re-reads for stable-watermark mode")
+	fs.IntVar(&cfg.MinCoveragePct, "min-coverage-pct", getenvInt("SYNCGUARD_MIN_COVERAGE_PCT", 80), "Warn when compared bucket coverage falls below this percentage")
+	fs.BoolVar(&cfg.LiveFallback, "live-fallback-for-dirty", getenvBool("SYNCGUARD_LIVE_FALLBACK_FOR_DIRTY", false), "Aggressively verify long-dirty buckets by hashing live table data")
+	fs.IntVar(&cfg.LiveFallbackAgeMS, "live-fallback-dirty-age-ms", getenvInt("SYNCGUARD_LIVE_FALLBACK_DIRTY_AGE_MS", 2000), "Minimum dirty age in milliseconds before live fallback is attempted")
 
 	return fs, cfg
 }
@@ -77,6 +83,12 @@ func (c *VerifyConfig) Validate() error {
 	}
 	if c.StabilityRetries < 0 {
 		return errors.New("stability-retries must be zero or greater")
+	}
+	if c.MinCoveragePct < 0 || c.MinCoveragePct > 100 {
+		return errors.New("min-coverage-pct must be between 0 and 100")
+	}
+	if c.LiveFallbackAgeMS < 0 {
+		return errors.New("live-fallback-dirty-age-ms must be zero or greater")
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -311,7 +312,11 @@ func verifyStableWatermark(ctx context.Context, pubPool, subPool *pgxpool.Pool, 
 
 		if previous == nil {
 			if cfg.StabilityRetries == 0 {
-				return stableSummaryFromRead(current, 0, false), nil
+				summary, err := finalizeStableSummary(ctx, pubPool, subPool, cfg, current, 0, true)
+				if err != nil {
+					return compare.Summary{}, err
+				}
+				return summary, nil
 			}
 			previous = &current
 			continue
@@ -319,7 +324,11 @@ func verifyStableWatermark(ctx context.Context, pubPool, subPool *pgxpool.Pool, 
 
 		if consistency.EqualEligibleBuckets(previous.publisherStable, current.publisherStable) &&
 			consistency.EqualEligibleBuckets(previous.subscriberStable, current.subscriberStable) {
-			return stableSummaryFromRead(current, attempt, true), nil
+			summary, err := finalizeStableSummary(ctx, pubPool, subPool, cfg, current, attempt, true)
+			if err != nil {
+				return compare.Summary{}, err
+			}
+			return summary, nil
 		}
 
 		previous = &current
@@ -328,7 +337,11 @@ func verifyStableWatermark(ctx context.Context, pubPool, subPool *pgxpool.Pool, 
 	if previous == nil {
 		return compare.Summary{}, errors.New("failed to collect stable-watermark snapshot")
 	}
-	return stableSummaryFromRead(*previous, cfg.StabilityRetries, false), nil
+	summary, err := finalizeStableSummary(ctx, pubPool, subPool, cfg, *previous, cfg.StabilityRetries, false)
+	if err != nil {
+		return compare.Summary{}, err
+	}
+	return summary, nil
 }
 
 func readStableWatermarkSnapshot(ctx context.Context, pubPool, subPool *pgxpool.Pool, cfg *config.VerifyConfig) (verifyRead, error) {
@@ -410,6 +423,240 @@ func stableSummaryFromRead(read verifyRead,
 	)
 }
 
+func finalizeStableSummary(
+	ctx context.Context,
+	pubPool, subPool *pgxpool.Pool,
+	cfg *config.VerifyConfig,
+	read verifyRead,
+	retriesUsed int,
+	stable bool,
+) (compare.Summary, error) {
+	summary := stableSummaryFromRead(read, retriesUsed, stable)
+
+	if cfg.LiveFallback && summary.SkippedBuckets > 0 {
+		liveApplied, refreshedSummary, err := applyLiveFallback(ctx, pubPool, subPool, cfg, read, summary)
+		if err != nil {
+			return compare.Summary{}, err
+		}
+		summary = refreshedSummary
+		summary.LiveFallbackBuckets = liveApplied
+	}
+
+	compare.FinalizeCoverage(&summary, cfg.MinCoveragePct)
+	return summary, nil
+}
+
+func applyLiveFallback(
+	ctx context.Context,
+	pubPool, subPool *pgxpool.Pool,
+	cfg *config.VerifyConfig,
+	read verifyRead,
+	summary compare.Summary,
+) (int, compare.Summary, error) {
+	olderThan := read.window.SharedAnchorAt.Add(-time.Duration(cfg.LiveFallbackAgeMS) * time.Millisecond)
+
+	pubDirty, err := extension.FetchDirtyBucketsOlderThan(ctx, pubPool, cfg.Schema, cfg.Table, olderThan)
+	if err != nil {
+		return 0, compare.Summary{}, fmt.Errorf("fetch publisher dirty buckets for live fallback: %w", err)
+	}
+	subDirty, err := extension.FetchDirtyBucketsOlderThan(ctx, subPool, cfg.Schema, cfg.Table, olderThan)
+	if err != nil {
+		return 0, compare.Summary{}, fmt.Errorf("fetch subscriber dirty buckets for live fallback: %w", err)
+	}
+
+	skippedKeys := skippedBucketKeys(read.publisherBuckets, read.subscriberBuckets, read.publisherStable, read.subscriberStable)
+	if len(skippedKeys) == 0 {
+		return 0, summary, nil
+	}
+
+	candidateKeys := dirtyCandidateKeys(pubDirty, subDirty)
+	pubMerged := bucketMapFromSlice(read.publisherStable)
+	subMerged := bucketMapFromSlice(read.subscriberStable)
+	metaCachePub := make(map[string]extension.MonitoredTable)
+	metaCacheSub := make(map[string]extension.MonitoredTable)
+	applied := 0
+
+	for key, dirty := range candidateKeys {
+		if _, ok := skippedKeys[key]; !ok {
+			continue
+		}
+
+		pubMeta, subMeta, err := loadMonitoredMetaPair(ctx, pubPool, subPool, metaCachePub, metaCacheSub, dirty.SchemaName, dirty.TableName)
+		if err != nil {
+			return 0, compare.Summary{}, err
+		}
+
+		pubLive, err := extension.FetchLiveBucketHash(ctx, pubPool, pubMeta, dirty.PKStart, dirty.PKEnd)
+		if err != nil {
+			return 0, compare.Summary{}, fmt.Errorf("fetch publisher live bucket hash for %s.%s bucket=%d: %w", dirty.SchemaName, dirty.TableName, dirty.BucketID, err)
+		}
+		subLive, err := extension.FetchLiveBucketHash(ctx, subPool, subMeta, dirty.PKStart, dirty.PKEnd)
+		if err != nil {
+			return 0, compare.Summary{}, fmt.Errorf("fetch subscriber live bucket hash for %s.%s bucket=%d: %w", dirty.SchemaName, dirty.TableName, dirty.BucketID, err)
+		}
+
+		pubMerged[key] = pubLive
+		subMerged[key] = subLive
+		applied++
+	}
+
+	if applied == 0 {
+		return 0, summary, nil
+	}
+
+	refreshed := compare.CompareStableBuckets(
+		read.publisherBuckets,
+		read.subscriberBuckets,
+		bucketSliceFromMap(pubMerged),
+		bucketSliceFromMap(subMerged),
+		compare.StableCompareMetadata{
+			ConsistencyMode:           summary.ConsistencyMode,
+			SnapshotStatus:            summary.SnapshotStatus,
+			PublisherCapturedAt:       summary.PublisherCapturedAt,
+			SubscriberCapturedAt:      summary.SubscriberCapturedAt,
+			SharedCutoffAt:            summary.SharedCutoffAt,
+			StabilizationRetriesUsed:  summary.StabilizationRetriesUsed,
+			PublisherDirtyQueueCount:  summary.PublisherDirtyQueueCount,
+			SubscriberDirtyQueueCount: summary.SubscriberDirtyQueueCount,
+		},
+	)
+
+	return applied, refreshed, nil
+}
+
+func skippedBucketKeys(
+	publisherAll []extension.BucketHash,
+	subscriberAll []extension.BucketHash,
+	publisherStable []extension.BucketHash,
+	subscriberStable []extension.BucketHash,
+) map[compare.BucketKey]struct{} {
+	all := make(map[compare.BucketKey]struct{}, len(publisherAll)+len(subscriberAll))
+	stable := make(map[compare.BucketKey]struct{}, len(publisherStable)+len(subscriberStable))
+
+	for _, bucket := range publisherAll {
+		all[bucketKey(bucket)] = struct{}{}
+	}
+	for _, bucket := range subscriberAll {
+		all[bucketKey(bucket)] = struct{}{}
+	}
+	for _, bucket := range publisherStable {
+		stable[bucketKey(bucket)] = struct{}{}
+	}
+	for _, bucket := range subscriberStable {
+		stable[bucketKey(bucket)] = struct{}{}
+	}
+
+	skipped := make(map[compare.BucketKey]struct{})
+	for key := range all {
+		if _, ok := stable[key]; ok {
+			continue
+		}
+		skipped[key] = struct{}{}
+	}
+	return skipped
+}
+
+func dirtyCandidateKeys(publisher, subscriber []extension.DirtyBucket) map[compare.BucketKey]extension.DirtyBucket {
+	candidates := make(map[compare.BucketKey]extension.DirtyBucket, len(publisher)+len(subscriber))
+	for _, dirty := range publisher {
+		candidates[dirtyBucketKey(dirty)] = dirty
+	}
+	for _, dirty := range subscriber {
+		key := dirtyBucketKey(dirty)
+		if existing, ok := candidates[key]; ok {
+			if dirty.QueuedAt.Before(existing.QueuedAt) {
+				candidates[key] = dirty
+			}
+			continue
+		}
+		candidates[key] = dirty
+	}
+	return candidates
+}
+
+func loadMonitoredMetaPair(
+	ctx context.Context,
+	pubPool, subPool *pgxpool.Pool,
+	pubCache, subCache map[string]extension.MonitoredTable,
+	schema, table string,
+) (extension.MonitoredTable, extension.MonitoredTable, error) {
+	cacheKey := schema + "." + table
+	pubMeta, ok := pubCache[cacheKey]
+	if !ok {
+		var err error
+		pubMeta, err = extension.FetchMonitoredTable(ctx, pubPool, schema, table)
+		if err != nil {
+			return extension.MonitoredTable{}, extension.MonitoredTable{}, fmt.Errorf("fetch publisher metadata for %s: %w", cacheKey, err)
+		}
+		pubCache[cacheKey] = pubMeta
+	}
+
+	subMeta, ok := subCache[cacheKey]
+	if !ok {
+		var err error
+		subMeta, err = extension.FetchMonitoredTable(ctx, subPool, schema, table)
+		if err != nil {
+			return extension.MonitoredTable{}, extension.MonitoredTable{}, fmt.Errorf("fetch subscriber metadata for %s: %w", cacheKey, err)
+		}
+		subCache[cacheKey] = subMeta
+	}
+
+	if pubMeta.PKColumn != subMeta.PKColumn {
+		return extension.MonitoredTable{}, extension.MonitoredTable{}, fmt.Errorf("pk column mismatch between publisher and subscriber for %s", cacheKey)
+	}
+	if pubMeta.BucketSize != subMeta.BucketSize {
+		return extension.MonitoredTable{}, extension.MonitoredTable{}, fmt.Errorf("bucket size mismatch between publisher and subscriber for %s", cacheKey)
+	}
+
+	return pubMeta, subMeta, nil
+}
+
+func bucketMapFromSlice(buckets []extension.BucketHash) map[compare.BucketKey]extension.BucketHash {
+	m := make(map[compare.BucketKey]extension.BucketHash, len(buckets))
+	for _, bucket := range buckets {
+		m[bucketKey(bucket)] = bucket
+	}
+	return m
+}
+
+func bucketSliceFromMap(m map[compare.BucketKey]extension.BucketHash) []extension.BucketHash {
+	keys := make([]compare.BucketKey, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].SchemaName != keys[j].SchemaName {
+			return keys[i].SchemaName < keys[j].SchemaName
+		}
+		if keys[i].TableName != keys[j].TableName {
+			return keys[i].TableName < keys[j].TableName
+		}
+		return keys[i].BucketID < keys[j].BucketID
+	})
+
+	out := make([]extension.BucketHash, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, m[key])
+	}
+	return out
+}
+
+func bucketKey(bucket extension.BucketHash) compare.BucketKey {
+	return compare.BucketKey{
+		SchemaName: bucket.SchemaName,
+		TableName:  bucket.TableName,
+		BucketID:   bucket.BucketID,
+	}
+}
+
+func dirtyBucketKey(bucket extension.DirtyBucket) compare.BucketKey {
+	return compare.BucketKey{
+		SchemaName: bucket.SchemaName,
+		TableName:  bucket.TableName,
+		BucketID:   bucket.BucketID,
+	}
+}
+
 type verifyRead struct {
 	publisherMetadata  extension.VerificationMetadata
 	subscriberMetadata extension.VerificationMetadata
@@ -442,6 +689,11 @@ Flags for verify:
   --consistency-mode      Verification consistency mode: stable-watermark or raw
   --stability-buffer-ms   Extra safety buffer in milliseconds for stable-watermark
   --stability-retries     Number of stabilization re-reads for stable-watermark
+  --min-coverage-pct      Warn when compared bucket coverage falls below this percentage
+  --live-fallback-for-dirty
+                          Aggressively verify long-dirty buckets with live hashing
+  --live-fallback-dirty-age-ms
+                          Minimum dirty age before live fallback is attempted
   --json                  Emit JSON output
   --write-control-plane   Persist run results to control plane
 
@@ -470,6 +722,9 @@ Environment variables:
   SYNCGUARD_CONSISTENCY_MODE
   SYNCGUARD_STABILITY_BUFFER_MS
   SYNCGUARD_STABILITY_RETRIES
+  SYNCGUARD_MIN_COVERAGE_PCT
+  SYNCGUARD_LIVE_FALLBACK_FOR_DIRTY
+  SYNCGUARD_LIVE_FALLBACK_DIRTY_AGE_MS
   SYNCGUARD_JSON
   SYNCGUARD_WRITE_CONTROL_PLANE`
 }

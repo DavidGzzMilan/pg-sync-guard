@@ -104,6 +104,17 @@ Important limitation:
 - this is a best-effort consistency window, not a strict cross-node snapshot or epoch guarantee
 - buckets that are still unstable are skipped rather than treated as definitive divergences
 - the CLI may report an `unstable_snapshot` if the eligible bucket set changes during repeated reads
+- the CLI may report `incomplete_coverage` if too many buckets are skipped, even when no mismatches are found among the buckets it could compare
+
+## Aggressive live fallback
+
+For high-write tables, long-dirty buckets can remain skipped for extended periods. The CLI can optionally use a more aggressive fallback mode:
+
+- identify buckets that have stayed dirty longer than a configured age threshold
+- compute live bucket hashes directly from the publisher and subscriber tables for those ranges
+- fold those results into the verify run so hot buckets do not remain permanently invisible
+
+This mode is more expensive than reading `syncguard.bucket_catalog`, but it improves visibility when the background worker is lagging behind sustained write load.
 
 ## Example queries
 

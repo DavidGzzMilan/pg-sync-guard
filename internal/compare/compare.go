@@ -39,12 +39,16 @@ type Summary struct {
 	Diffs                     []BucketDiff `json:"diffs"`
 	ConsistencyMode           string       `json:"consistency_mode,omitempty"`
 	SnapshotStatus            string       `json:"snapshot_status,omitempty"`
+	CoverageStatus            string       `json:"coverage_status,omitempty"`
+	CoveragePct               int          `json:"coverage_pct,omitempty"`
+	MinCoveragePct            int          `json:"min_coverage_pct,omitempty"`
 	PublisherCapturedAt       *time.Time   `json:"publisher_captured_at,omitempty"`
 	SubscriberCapturedAt      *time.Time   `json:"subscriber_captured_at,omitempty"`
 	SharedCutoffAt            *time.Time   `json:"shared_cutoff_at,omitempty"`
 	StabilizationRetriesUsed  int          `json:"stabilization_retries_used,omitempty"`
 	PublisherDirtyQueueCount  int          `json:"publisher_dirty_queue_count,omitempty"`
 	SubscriberDirtyQueueCount int          `json:"subscriber_dirty_queue_count,omitempty"`
+	LiveFallbackBuckets       int          `json:"live_fallback_buckets,omitempty"`
 }
 
 type StableCompareMetadata struct {
@@ -240,6 +244,84 @@ func CompareStableBuckets(
 
 	summary.MismatchedBuckets = len(summary.Diffs)
 	return summary
+}
+
+func ApplyLiveFallback(summary *Summary, compared []extension.BucketHash, counterpart []extension.BucketHash) {
+	if len(compared) == 0 && len(counterpart) == 0 {
+		return
+	}
+
+	byKeyLeft := bucketSetMap(compared)
+	byKeyRight := bucketSetMap(counterpart)
+	keys := unionKeys(bucketSetKeys(compared), bucketSetKeys(counterpart))
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].SchemaName != keys[j].SchemaName {
+			return keys[i].SchemaName < keys[j].SchemaName
+		}
+		if keys[i].TableName != keys[j].TableName {
+			return keys[i].TableName < keys[j].TableName
+		}
+		return keys[i].BucketID < keys[j].BucketID
+	})
+
+	for _, key := range keys {
+		left, leftOK := byKeyLeft[key]
+		right, rightOK := byKeyRight[key]
+		if !leftOK || !rightOK {
+			continue
+		}
+
+		if summary.SkippedBuckets > 0 {
+			summary.SkippedBuckets--
+		}
+		if summary.SkippedOnPublisher > 0 {
+			summary.SkippedOnPublisher--
+		}
+		if summary.SkippedOnSubscriber > 0 {
+			summary.SkippedOnSubscriber--
+		}
+
+		summary.ComparedBuckets++
+		summary.LiveFallbackBuckets++
+
+		status := classify(left, right)
+		if status == "match" {
+			continue
+		}
+		summary.Diffs = append(summary.Diffs, BucketDiff{
+			SchemaName:      key.SchemaName,
+			TableName:       key.TableName,
+			BucketID:        key.BucketID,
+			PKStart:         chooseRange(left.PKStart, right.PKStart),
+			PKEnd:           chooseRange(left.PKEnd, right.PKEnd),
+			PublisherHash:   left.BucketHash,
+			SubscriberHash:  right.BucketHash,
+			PublisherCount:  &left.RowCount,
+			SubscriberCount: &right.RowCount,
+			Status:          status,
+		})
+	}
+
+	summary.MismatchedBuckets = len(summary.Diffs)
+}
+
+func FinalizeCoverage(summary *Summary, minCoveragePct int) {
+	summary.MinCoveragePct = minCoveragePct
+	if summary.TotalBuckets == 0 {
+		summary.CoveragePct = 100
+		summary.CoverageStatus = "complete"
+		return
+	}
+
+	summary.CoveragePct = (summary.ComparedBuckets * 100) / summary.TotalBuckets
+	if summary.CoveragePct < minCoveragePct {
+		summary.CoverageStatus = "incomplete_coverage"
+		if summary.SnapshotStatus == "" || summary.SnapshotStatus == "stable" {
+			summary.SnapshotStatus = "incomplete_coverage"
+		}
+		return
+	}
+	summary.CoverageStatus = "complete"
 }
 
 func classify(pub, sub extension.BucketHash) string {
