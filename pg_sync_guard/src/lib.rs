@@ -271,12 +271,8 @@ fn recompute_bucket(
         SELECT count(*)::bigint, md5(string_agg(h, '' ORDER BY h))
         FROM b"
     );
-    let hash_args = [
-        DatumWithOid::from(pk_start),
-        DatumWithOid::from(pk_end),
-    ];
-    let (row_count, bucket_hash) =
-        Spi::get_two_with_args::<i64, String>(&hash_sql, &hash_args)?;
+    let hash_args = [DatumWithOid::from(pk_start), DatumWithOid::from(pk_end)];
+    let (row_count, bucket_hash) = Spi::get_two_with_args::<i64, String>(&hash_sql, &hash_args)?;
     let row_count = row_count.unwrap_or(0);
 
     if row_count == 0 {
@@ -334,19 +330,33 @@ fn recompute_bucket(
 
 fn process_next_dirty_bucket() -> Result<bool, DynError> {
     let sql = "
+        WITH claimed AS (
+            DELETE FROM syncguard.dirty_buckets d
+            WHERE d.ctid = (
+                SELECT d2.ctid
+                FROM syncguard.dirty_buckets d2
+                ORDER BY d2.queued_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING
+                d.schema_name,
+                d.table_name,
+                d.bucket_id,
+                d.pk_start,
+                d.pk_end
+        )
         SELECT
-            d.schema_name,
-            d.table_name,
+            c.schema_name,
+            c.table_name,
             m.pk_column,
-            d.bucket_id,
-            d.pk_start,
-            d.pk_end
-        FROM syncguard.dirty_buckets d
+            c.bucket_id,
+            c.pk_start,
+            c.pk_end
+        FROM claimed c
         JOIN syncguard.monitored_tables m
-          ON m.schema_name = d.schema_name
-         AND m.table_name = d.table_name
-        ORDER BY d.queued_at
-        LIMIT 1
+          ON m.schema_name = c.schema_name
+         AND m.table_name = c.table_name
     ";
     let maybe_bucket = Spi::connect_mut(|client| -> spi::Result<_> {
         let table = client.update(sql, Some(1), &[])?;
@@ -364,8 +374,14 @@ fn process_next_dirty_bucket() -> Result<bool, DynError> {
         )))
     })?;
 
-    let Some((Some(schema_name), Some(table_name), Some(pk_column), Some(bucket_id), Some(pk_start), Some(pk_end))) =
-        maybe_bucket
+    let Some((
+        Some(schema_name),
+        Some(table_name),
+        Some(pk_column),
+        Some(bucket_id),
+        Some(pk_start),
+        Some(pk_end),
+    )) = maybe_bucket
     else {
         return Ok(false);
     };
@@ -378,19 +394,6 @@ fn process_next_dirty_bucket() -> Result<bool, DynError> {
         pk_start,
         pk_end,
     )?;
-
-    let delete_sql = "
-        DELETE FROM syncguard.dirty_buckets
-        WHERE schema_name = $1
-          AND table_name = $2
-          AND bucket_id = $3
-    ";
-    let delete_args = [
-        DatumWithOid::from(schema_name.as_str()),
-        DatumWithOid::from(table_name.as_str()),
-        DatumWithOid::from(bucket_id),
-    ];
-    Spi::run_with_args(delete_sql, &delete_args)?;
 
     Ok(true)
 }
@@ -427,8 +430,13 @@ fn process_next_backfill_bucket(default_bucket_size: i64) -> Result<bool, DynErr
         )))
     })?;
 
-    let Some((Some(schema_name), Some(table_name), Some(pk_column), Some(bucket_size), Some(next_backfill_pk))) =
-        maybe_table
+    let Some((
+        Some(schema_name),
+        Some(table_name),
+        Some(pk_column),
+        Some(bucket_size),
+        Some(next_backfill_pk),
+    )) = maybe_table
     else {
         return Ok(false);
     };
@@ -818,19 +826,12 @@ fn syncguard_register_table(
 
     match result {
         Ok(msg) => msg,
-        Err(e) => format!(
-            "Failed to register {}.{}: {}",
-            schema_name, table_name, e
-        ),
+        Err(e) => format!("Failed to register {}.{}: {}", schema_name, table_name, e),
     }
 }
 
 #[pg_extern]
-fn syncguard_mark_bucket_reviewed(
-    schema_name: &str,
-    table_name: &str,
-    bucket_id: i64,
-) -> bool {
+fn syncguard_mark_bucket_reviewed(schema_name: &str, table_name: &str, bucket_id: i64) -> bool {
     let sql = "
         UPDATE syncguard.bucket_catalog
         SET reviewed_at = now()
