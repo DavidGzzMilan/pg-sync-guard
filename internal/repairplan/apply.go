@@ -14,6 +14,7 @@ type ApplySummary struct {
 	BucketID          int64                  `json:"bucket_id"`
 	StatementsPlanned int                    `json:"statements_planned"`
 	StatementsApplied int                    `json:"statements_applied"`
+	ResolvedLogs      int64                  `json:"resolved_logs,omitempty"`
 	InspectSummary    compare.InspectSummary `json:"inspect_summary"`
 }
 

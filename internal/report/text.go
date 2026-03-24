@@ -172,6 +172,11 @@ func WriteRepairText(w io.Writer, publisherName, subscriberName string, summary 
 		return err
 	}
 
+	if summary.ResolvedLogs > 0 {
+		_, err := fmt.Fprintf(w, "Resolved %d control-plane divergence row(s).\n", summary.ResolvedLogs)
+		return err
+	}
+
 	return nil
 }
 

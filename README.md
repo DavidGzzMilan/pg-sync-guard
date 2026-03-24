@@ -168,6 +168,8 @@ go run ./cmd/syncguard-cli repair \
 
 Note: subscriber-side repairs fire SyncGuard's dirty-bucket trigger. In the current codebase, those helper functions are meant to run with extension-owner privileges, so the CLI repair role should only need DML rights on the target subscriber table plus the read access documented in `docs/REQUIRED_GRANTS.md`.
 
+If `--control-dsn` is provided to `repair`, the CLI also marks matching open `syncguard.divergence_log` rows for that bucket as `resolved` and sets `reviewed_at` / `resolved_at`.
+
 ## Documentation
 
 - extension guide: `docs/PG_EXTENSION.md`

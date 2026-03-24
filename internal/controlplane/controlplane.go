@@ -152,3 +152,29 @@ func formatTime(value *time.Time) string {
 	}
 	return value.UTC().Format(time.RFC3339Nano)
 }
+
+func ResolveBucketDivergences(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	schemaName string,
+	tableName string,
+	bucketID int64,
+) (int64, error) {
+	tag, err := pool.Exec(ctx, `
+UPDATE syncguard.divergence_log
+SET status = 'resolved',
+    reviewed_at = COALESCE(reviewed_at, now()),
+    resolved_at = now()
+WHERE schema_name = $1
+  AND table_name = $2
+  AND bucket_id = $3
+  AND status = 'open'`,
+		strings.TrimSpace(schemaName),
+		strings.TrimSpace(tableName),
+		bucketID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("resolve divergence log rows: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}

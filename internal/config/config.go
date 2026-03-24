@@ -36,6 +36,7 @@ type InspectConfig struct {
 type RepairConfig struct {
 	PublisherDSN  string
 	SubscriberDSN string
+	ControlDSN    string
 	Schema        string
 	Table         string
 	BucketID      int64
@@ -132,6 +133,7 @@ func NewRepairCommand() (*flag.FlagSet, *RepairConfig) {
 
 	fs.StringVar(&cfg.PublisherDSN, "publisher-dsn", getenv("SYNCGUARD_PUBLISHER_DSN", ""), "PostgreSQL DSN for the publisher")
 	fs.StringVar(&cfg.SubscriberDSN, "subscriber-dsn", getenv("SYNCGUARD_SUBSCRIBER_DSN", ""), "PostgreSQL DSN for the subscriber")
+	fs.StringVar(&cfg.ControlDSN, "control-dsn", getenv("SYNCGUARD_CONTROL_DSN", ""), "Optional PostgreSQL DSN for the control plane")
 	fs.StringVar(&cfg.Schema, "schema", getenv("SYNCGUARD_SCHEMA", ""), "Schema name for the monitored table")
 	fs.StringVar(&cfg.Table, "table", getenv("SYNCGUARD_TABLE", ""), "Table name for the monitored table")
 	fs.Int64Var(&cfg.BucketID, "bucket-id", 0, "Bucket identifier to repair")

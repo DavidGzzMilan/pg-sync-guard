@@ -75,6 +75,12 @@ The intended split is:
    - `total_buckets_compared`
    - `mismatched_buckets`
 
+When a later `repair` succeeds for a bucket, the CLI can also update matching open rows in `syncguard.divergence_log` by:
+
+- setting `status = 'resolved'`
+- setting `reviewed_at`
+- setting `resolved_at`
+
 ## Notes
 
 - The control plane is intentionally separate from the extension state.

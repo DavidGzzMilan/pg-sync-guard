@@ -196,6 +196,26 @@ func runRepair(args []string) error {
 		return fmt.Errorf("apply repair plan: %w", err)
 	}
 
+	if cfg.ControlDSN != "" {
+		controlPool, err := db.Connect(ctx, cfg.ControlDSN)
+		if err != nil {
+			return fmt.Errorf("connect control plane: %w", err)
+		}
+		defer controlPool.Close()
+
+		resolved, err := controlplane.ResolveBucketDivergences(
+			ctx,
+			controlPool,
+			inspectSummary.SchemaName,
+			inspectSummary.TableName,
+			inspectSummary.BucketID,
+		)
+		if err != nil {
+			return fmt.Errorf("update control plane repair lifecycle: %w", err)
+		}
+		applySummary.ResolvedLogs = resolved
+	}
+
 	if cfg.JSON {
 		if err := report.WriteRepairJSON(os.Stdout, publisherName, subscriberName, applySummary); err != nil {
 			return fmt.Errorf("write JSON repair report: %w", err)
@@ -708,6 +728,7 @@ Flags for inspect:
 Flags for repair:
   --publisher-dsn         PostgreSQL DSN for publisher
   --subscriber-dsn        PostgreSQL DSN for subscriber
+  --control-dsn           Optional PostgreSQL DSN for control plane
   --schema                Schema name for the monitored table
   --table                 Table name for the monitored table
   --bucket-id             Bucket identifier to repair
