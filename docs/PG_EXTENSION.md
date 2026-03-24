@@ -86,6 +86,36 @@ If a bucket hash differs, the CLI can decide whether to:
 - plan a repair action
 - persist job history in the control plane database
 
+## Stable watermark verification
+
+The current CLI can run `verify` in a lightweight `stable-watermark` mode. It uses existing extension metadata rather than a new in-database coordination protocol:
+
+- it reads each side's current database time
+- it reads `syncguard.naptime_ms`
+- it computes a conservative shared cutoff in the past
+- it compares only buckets where:
+  - `dirty = false`
+  - `last_computed_at <= shared_cutoff`
+
+The goal is to reduce false divergences caused by sampling publisher and subscriber while dirty buckets are still being recomputed at different times.
+
+Important limitation:
+
+- this is a best-effort consistency window, not a strict cross-node snapshot or epoch guarantee
+- buckets that are still unstable are skipped rather than treated as definitive divergences
+- the CLI may report an `unstable_snapshot` if the eligible bucket set changes during repeated reads
+- the CLI may report `incomplete_coverage` if too many buckets are skipped, even when no mismatches are found among the buckets it could compare
+
+## Aggressive live fallback
+
+For high-write tables, long-dirty buckets can remain skipped for extended periods. The CLI can optionally use a more aggressive fallback mode:
+
+- identify buckets that have stayed dirty longer than a configured age threshold
+- compute live bucket hashes directly from the publisher and subscriber tables for those ranges
+- fold those results into the verify run so hot buckets do not remain permanently invisible
+
+This mode is more expensive than reading `syncguard.bucket_catalog`, but it improves visibility when the background worker is lagging behind sustained write load.
+
 ## Example queries
 
 ### See monitored tables
@@ -131,3 +161,4 @@ ORDER BY last_computed_at DESC, schema_name, table_name, bucket_id;
 - `bucket_catalog`, `dirty_buckets`, and `worker_state` are **UNLOGGED** because they are reconstructable and should not add unnecessary WAL pressure.
 - `monitored_tables` remains logged because it is configuration and should survive crash recovery.
 - The current trigger/incremental model assumes a **single integer-like primary key column** for bucket boundaries.
+- A future improvement is a stronger extension-assisted verification epoch/barrier model, ideally delivered with a proper extension upgrade path via `ALTER EXTENSION UPDATE`.

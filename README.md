@@ -1,130 +1,207 @@
 # pg-sync-guard
 
-SyncGuard currently has two complementary pieces:
+`pg-sync-guard` is now an **extension-first** project for efficient logical-replication verification.
 
-- a **Python validator/repair CLI** in `sync_guard/` for comparing Publisher and Subscriber directly, logging divergences, and planning or applying repairs
-- a **PostgreSQL extension** in `pg_sync_guard/` that runs inside each database and maintains stable per-bucket hashes for local tables
+The repository currently centers on:
 
-The overall goal is to validate data consistency between a PostgreSQL Logical Replication **Publisher** and **Subscriber** efficiently, even for very large tables.
+- `pg_sync_guard/`: a PostgreSQL extension that computes and persists **stable per-bucket hashes** inside each database
+- `cmd/syncguard-cli/`: the first Go CLI foundation for comparing publisher and subscriber bucket catalogs
 
-## Features
+The old Python prototype and dashboard have been removed so the repository matches the current product direction.
 
-- **Schema analysis**: Inspects the target table on the Publisher to discover the Primary Key and high-churn columns (by type).
-- **Bucket hash validation**: Splits the table into \(N\) segments by PK order, computes a deterministic per-segment hash with `md5(row_to_json(...))` and `string_agg(..., '' ORDER BY pk)`, runs the same query on both sides in parallel, and compares results.
-- **Pinpoint & repair**: On mismatch, recursively narrows the segment (same hash query restricted to the segment’s PK range with \(N=2\)) until the range has at most a small batch of rows; then fetches those rows from the Publisher and runs `INSERT ... ON CONFLICT DO UPDATE` on the Subscriber.
+## Current architecture
 
-## PostgreSQL extension
+Install `pg_sync_guard` on **both** publisher and subscriber:
 
-The newer extension-based architecture is documented in **[docs/PG_EXTENSION.md](docs/PG_EXTENSION.md)**.
+- each side computes local bucket hashes
+- the extension tracks dirty buckets and recomputes only the buckets affected by changes in the normal case
+- the Go CLI compares `syncguard.bucket_catalog` across both sides
+- an optional control plane database can store verification-job history and divergence records
 
-At a high level:
+## Repository layout
 
-- install `pg_sync_guard` on **both** Publisher and Subscriber
-- register monitored tables locally with `syncguard_register_table(...)`
-- let the extension worker maintain **stable per-bucket hashes** in `syncguard.bucket_catalog`
-- have an external CLI fetch and compare those hashes across both sides
-- persist verification history and divergences in the Control Plane if desired
+- `pg_sync_guard/`
+  - pgrx extension crate
+  - dynamic per-database background worker
+  - bucket catalog, dirty bucket queue, worker state, and helper SQL functions
+- `cmd/syncguard-cli/`
+  - Go CLI entrypoint
+  - currently includes MVP `verify` command scaffolding
+- `internal/`
+  - shared Go packages for config, DB access, extension reads, comparison, reporting, and control-plane writes
+- `docs/PG_EXTENSION.md`
+  - extension usage, worker model, and example queries
+- `docs/CONTROL_PLANE.md`
+  - optional control-plane schema for verification history
+- `docs/REQUIRED_GRANTS.md`
+  - grants for extension access, table registration, and control-plane access
 
-This is the preferred direction for large-table efficiency because the extension can keep a **dirty bucket queue** and usually recompute only the buckets affected by row changes.
+## Extension features
 
-## Database user privileges
+- stable **per-bucket hashes** stored in `syncguard.bucket_catalog`
+- **dirty bucket** queue in `syncguard.dirty_buckets`
+- **dynamic worker** started per database
+- initial full sweep plus incremental recomputation
+- trigger-based dirty marking, including subscriber-side logical replication changes via `ENABLE ALWAYS TRIGGER`
+- reconstructable runtime state stored in **UNLOGGED** tables to reduce WAL pressure
 
-The role used to connect to Publisher and Subscriber needs specific grants. See **[docs/REQUIRED_GRANTS.md](docs/REQUIRED_GRANTS.md)** for:
+## Quick start
 
-- Python validator / repair grants
-- Control Plane grants
-- extension-side grants for reading `syncguard.bucket_catalog` and registering monitored tables
+### 1. Build / run the extension during development
 
-## Control Plane (optional)
-
-To track runs and remediation in a central schema (e.g. `syncguard.validation_runs` and `syncguard.divergence_log`), use a **separate connection** to a control database and pass `control_conn` to `validate_and_repair` or `validate_only`. See **[docs/CONTROL_PLANE.md](docs/CONTROL_PLANE.md)** for the schema DDL and usage.
-
-## Dashboard (optional)
-
-A **Streamlit dashboard** reads from the Control database and shows metrics, validation run history, and divergence details. For an **asynchronous workflow**: run validation in **validate-only** mode (e.g. `python main.py --validate-only` or `validate_only()` in code) so the process only finds and logs divergences; then use the dashboard’s **Execute Repair** to apply repairs from the UI. For a **one-shot** run that validates and repairs in a single process, use `validate_and_repair()` or `python main.py` without `--validate-only`. See **[dashboard/README.md](dashboard/README.md)** for setup; run with:
+From `pg_sync_guard/`:
 
 ```bash
-pip install -e ".[dashboard]"
-streamlit run dashboard/app.py
+cargo pgrx run
 ```
 
-## Install
-
-```bash
-pip install -e .
-# or
-pip install -r requirements.txt
-```
-
-## Python validator quick usage
-
-```python
-import asyncio
-import asyncpg
-from sync_guard import SyncGuard, validate_and_repair
-
-async def main():
-    pub = await asyncpg.connect("postgres://user:pass@publisher-host/db")
-    sub = await asyncpg.connect("postgres://user:pass@subscriber-host/db")
-    guard = SyncGuard(pub, sub, num_segments=32)
-    repaired = await validate_and_repair(guard, "public", "my_table")
-    print("Repaired PKs:", repaired)
-    await pub.close()
-    await sub.close()
-
-asyncio.run(main())
-```
-
-## Extension quick usage
-
-See **[docs/PG_EXTENSION.md](docs/PG_EXTENSION.md)** for the full extension workflow. Minimal example:
+### 2. Create the extension
 
 ```sql
 CREATE EXTENSION pg_sync_guard;
+```
 
+### 3. Register a monitored table
+
+```sql
 SELECT syncguard_register_table('public', 'my_table', 'id', 5000);
+```
 
+### 4. Confirm the worker is running
+
+```sql
 SELECT syncguard_worker_running();
+```
 
+### 5. Inspect bucket hashes
+
+```sql
 SELECT *
 FROM syncguard.bucket_catalog
 ORDER BY schema_name, table_name, bucket_id;
 ```
 
-## Class structure
+### 6. Run the CLI verify command
 
-| Component | Role |
-|-----------|------|
-| **SyncGuard** | Holds publisher/subscriber connections and table metadata; runs parallel hash queries and comparison. |
-| **analyze_schema(schema, table)** | Inspects table on Publisher → PK columns and high-churn column list. |
-| **validate(schema, table)** | Runs bucket hash on both DBs in parallel; returns list of mismatched segments. |
-| **validate_and_repair(guard, schema, table)** | Validates, then for each mismatched segment recursively pinpoints and repairs (upsert from Publisher to Subscriber). |
-| **sync_guard.schema** | `analyze_table()`, `TableInfo`, `ColumnInfo`, high-churn type set. |
-| **sync_guard.hash_queries** | Builds full-table and bounded bucket-hash SQL, row-count, and upsert SQL. |
+With Go available locally:
 
-## Recursive SQL logic (hashing)
+```bash
+go run ./cmd/syncguard-cli verify \
+  --publisher-dsn "$SYNCGUARD_PUBLISHER_DSN" \
+  --subscriber-dsn "$SYNCGUARD_SUBSCRIBER_DSN"
+```
 
-**1. Full-table bucket hash (initial validation)**
+Optional flags:
 
-- **CTE `base`**: `SELECT * FROM "schema"."table"`.
-- **CTE `segmented`**: `SELECT base.*, ntile($1::int) OVER (ORDER BY pk_cols) AS segment FROM base`.
-- **CTE `segment_hashes`**:  
-  `SELECT segment, md5(string_agg(md5(row_to_json(segmented)::text), '' ORDER BY pk_cols)) AS segment_hash FROM segmented GROUP BY segment`.
-- **CTE `segment_bounds`**: For each segment, `min(pk_i)`, `max(pk_i)` for every PK column (for later narrowing).
-- **Final SELECT**: Join hashes and bounds so each row has `segment`, `segment_hash`, `min_*`, `max_*`.
+- `--schema public`
+- `--table my_table`
+- `--consistency-mode stable-watermark`
+- `--stability-buffer-ms 250`
+- `--stability-retries 1`
+- `--min-coverage-pct 80`
+- `--live-fallback-for-dirty`
+- `--live-fallback-dirty-age-ms 2000`
+- `--json`
+- `--control-dsn "$SYNCGUARD_CONTROL_DSN" --write-control-plane`
 
-Parameters: `$1` = number of segments \(N\).
+`verify` now defaults to `stable-watermark` mode. In that mode, the CLI:
 
-**2. Bounded bucket hash (recursive pinpoint)**
+- reads each side's database time and `syncguard.naptime_ms`
+- computes a conservative shared cutoff in the past
+- compares only buckets that are `dirty = false` and whose `last_computed_at` is older than that cutoff on both sides
+- optionally re-reads the eligible bucket set to see whether the snapshot stabilizes
 
-- Same structure as above, but **CTE `base`** is restricted with:
-  `WHERE (pk1, pk2, ...) >= ($2, $3, ...) AND (pk1, pk2, ...) <= ($k+2, ...)`.
-- Parameters: `$1` = number of segments (e.g. 2), then lower bound PK values, then upper bound PK values.
-- Used to split a mismatched segment into sub-segments and recurse until the range is small enough to repair in one batch.
+This is a best-effort consistency window that reduces false positives from in-flight rehashing. It is not a strict cross-node snapshot guarantee.
 
-**3. Repair**
+If too many buckets are still unstable, `verify` now reports an explicit coverage warning instead of looking like a fully trustworthy clean run.
 
-- Fetch: `SELECT * FROM table WHERE (pk,...) >= (...) AND (pk,...) <= (...) ORDER BY pk_cols`.
-- Upsert: `INSERT INTO table (...) VALUES ($1,...) ON CONFLICT (pk_cols) DO UPDATE SET col = EXCLUDED.col, ...`.
+For hotter tables, you can enable a more aggressive mode:
 
-Determinism: both sides use the same `ORDER BY pk_cols` in `ntile` and in `string_agg`, so identical data yields the same segment hashes.
+```bash
+go run ./cmd/syncguard-cli verify \
+  --publisher-dsn "$SYNCGUARD_PUBLISHER_DSN" \
+  --subscriber-dsn "$SYNCGUARD_SUBSCRIBER_DSN" \
+  --consistency-mode stable-watermark \
+  --min-coverage-pct 80 \
+  --live-fallback-for-dirty \
+  --live-fallback-dirty-age-ms 2000
+```
+
+In that mode, buckets that remain dirty beyond the configured age threshold are foreground-hashed directly from the live publisher and subscriber tables, so long-dirty ranges do not stay invisible forever.
+
+### 7. Inspect one mismatched bucket
+
+After `verify` reports a mismatched bucket, drill into the affected PK window:
+
+```bash
+go run ./cmd/syncguard-cli inspect \
+  --publisher-dsn "$SYNCGUARD_PUBLISHER_DSN" \
+  --subscriber-dsn "$SYNCGUARD_SUBSCRIBER_DSN" \
+  --schema public \
+  --table my_table \
+  --bucket-id 42
+```
+
+This reads `syncguard.monitored_tables` to discover the PK column and bucket size, then compares the full rows inside that bucket range on publisher and subscriber.
+
+Note: `inspect` requires the CLI role to have direct `SELECT` on the target application table, not just on the `syncguard` schema objects.
+
+For each row-level divergence, `inspect` now also generates a suggested repair SQL plan for the subscriber:
+
+- `INSERT ... ON CONFLICT DO UPDATE` when the publisher row should be copied to the subscriber
+- `DELETE` when the subscriber has an extra row that is missing on the publisher
+
+### 8. Explicitly apply planned repairs
+
+When you want to execute the suggested repair SQL against the subscriber, use `repair`:
+
+```bash
+go run ./cmd/syncguard-cli repair \
+  --publisher-dsn "$SYNCGUARD_PUBLISHER_DSN" \
+  --subscriber-dsn "$SYNCGUARD_SUBSCRIBER_DSN" \
+  --schema public \
+  --table my_table \
+  --bucket-id 42
+```
+
+`repair` re-runs the bucket inspection, rebuilds the repair plan, and applies the statements to the subscriber in a single transaction. It never runs implicitly as part of `verify` or `inspect`.
+
+Note: subscriber-side repairs fire SyncGuard's dirty-bucket trigger. In the current codebase, those helper functions are meant to run with extension-owner privileges, so the CLI repair role should only need DML rights on the target subscriber table plus the read access documented in `docs/REQUIRED_GRANTS.md`.
+
+If `--control-dsn` is provided to `repair`, the CLI also marks matching open `syncguard.divergence_log` rows for that bucket as `resolved` and sets `reviewed_at` / `resolved_at`.
+
+## Documentation
+
+- extension guide: `docs/PG_EXTENSION.md`
+- control plane: `docs/CONTROL_PLANE.md`
+- grants: `docs/REQUIRED_GRANTS.md`
+
+## Current CLI scope
+
+The current Go CLI foundation includes:
+
+- config loading from flags and environment variables
+- PostgreSQL connectivity using `pgx`
+- reads from `syncguard.bucket_catalog`
+- reads from `syncguard.monitored_tables`
+- publisher/subscriber bucket comparison
+- stable-watermark verification mode with skipped unstable buckets
+- coverage warnings when stable verification sees too little of the catalog
+- optional live fallback hashing for long-dirty buckets
+- bucket-level row drill-down with `inspect`
+- suggested subscriber repair SQL from row-level diffs
+- explicit subscriber-side apply flow with `repair`
+- text or JSON output
+- optional control-plane inserts for `validation_runs` and `divergence_log`
+
+The next CLI steps are controlled execution and packaging.
+
+## Near-term roadmap
+
+- execute approved remediation workflows from the CLI
+- package the CLI for `.rpm` / `.deb` delivery
+
+## Backlog
+
+- add a real extension upgrade path so SQL/object changes are applied through `ALTER EXTENSION UPDATE`
+- add a stronger extension-assisted epoch/barrier verification model for true coordinated cross-node comparisons
