@@ -717,12 +717,19 @@ fn syncguard_stop_worker() -> String {
         None => return "Could not determine current database".to_string(),
     };
 
+    // Do not call pg_terminate_backend() inside the same WHERE as other filters:
+    // PostgreSQL does not guarantee short-circuit evaluation order, so the backend
+    // running this statement (same datname) could be SIGTERM'd before backend_type
+    // is checked — taking down the session and destabilizing the cluster.
     let sql = "
-        SELECT count(*)
-        FROM pg_stat_activity
-        WHERE datname = $1
-          AND backend_type = 'SyncGuard Worker'
-          AND pg_terminate_backend(pid)
+        SELECT coalesce(sum((terminated)::int), 0)::bigint
+        FROM (
+            SELECT pg_terminate_backend(pid) AS terminated
+            FROM pg_stat_activity
+            WHERE datname = $1
+              AND backend_type = 'SyncGuard Worker'
+              AND pid <> pg_backend_pid()
+        ) stop_targets
     ";
     let args = [DatumWithOid::from(dbname.as_str())];
 
